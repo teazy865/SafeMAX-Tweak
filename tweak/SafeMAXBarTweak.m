@@ -10,9 +10,13 @@ static NSString *const kShowLabelsKey = @"SafeMAX_ShowLabels";
 static NSString *const kFloatingKey = @"SafeMAX_FloatingDock";
 static NSString *const kGlassKey = @"SafeMAX_LiquidGlass";
 static NSString *const kOrderKey = @"SafeMAX_TabOrder";
+static NSString *const kHiddenKey = @"SafeMAX_HiddenTabs";
+static NSString *const kExtraKey = @"SafeMAX_ExtraTabs";
+static NSString *const kFavoritesTitle = @"Избранное";
 
 static const NSInteger kEntryTag = 0x5AF1;
 static const NSInteger kPillTag = 0x5AF3;
+static const NSInteger kExtraTag = 0x5AF4;
 
 static Class TabBarClass;
 static Class SettingsClass;
@@ -166,62 +170,6 @@ static void applyLabels(UIView *bar) {
     });
 }
 
-static UIImageView *largestIcon(UIView *item) {
-    __block UIImageView *best = nil;
-    __block CGFloat bestArea = 0;
-    __block void (^walk)(UIView *);
-    walk = ^(UIView *view) {
-        if (!view || view.tag == kPillTag || view.hidden) return;
-        if ([view isKindOfClass:[UIImageView class]] && ((UIImageView *)view).image) {
-            CGFloat area = view.bounds.size.width * view.bounds.size.height;
-            if (area > bestArea) {
-                best = (UIImageView *)view;
-                bestArea = area;
-            }
-        }
-        for (UIView *sub in view.subviews) walk(sub);
-    };
-    walk(item);
-    return best;
-}
-
-static void pinIconsToPill(UIView *bar) {
-    UIView *pill = [bar viewWithTag:kPillTag];
-    BOOL labelsOn = showLabels();
-    for (UIView *item in tabItems(bar)) {
-        UIImageView *icon = largestIcon(item);
-        if (!icon.superview) continue;
-        if (labelsOn || !pill) {
-            NSValue *saved = objc_getAssociatedObject(icon, "sm_iconCenter");
-            if (saved) {
-                icon.center = saved.CGPointValue;
-                objc_setAssociatedObject(icon, "sm_iconCenter", nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            }
-            continue;
-        }
-        if (!objc_getAssociatedObject(icon, "sm_iconCenter")) {
-            objc_setAssociatedObject(icon, "sm_iconCenter", [NSValue valueWithCGPoint:icon.center], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        }
-        CGPoint mid = [pill convertPoint:CGPointMake(CGRectGetMidX(pill.bounds), CGRectGetMidY(pill.bounds)) toView:icon.superview];
-        CGFloat slotX = [item convertPoint:CGPointMake(CGRectGetMidX(item.bounds), 0) toView:icon.superview].x;
-        icon.center = CGPointMake(slotX, mid.y);
-    }
-}
-
-static void scheduleIconPin(UIView *bar) {
-    if (showLabels() || !floatingDock()) return;
-    NSTimeInterval now = CACurrentMediaTime();
-    NSNumber *last = objc_getAssociatedObject(bar, "sm_pinAt");
-    if (last && now - last.doubleValue < 0.3) return;
-    objc_setAssociatedObject(bar, "sm_pinAt", @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        pinIconsToPill(bar);
-    });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        pinIconsToPill(bar);
-    });
-}
-
 static void applyOrder(UIView *bar) {
     NSArray<NSString *> *order = savedOrder();
     if (order.count == 0) return;
@@ -344,7 +292,7 @@ static CGRect chromeBounds(UIView *bar) {
     __block CGRect box = CGRectNull;
     __block void (^recurse)(UIView *);
     recurse = ^(UIView *view) {
-        if (!view || view.tag == kPillTag || view.hidden || view.alpha < 0.05) return;
+        if (!view || view.tag == kPillTag || view.tag == kExtraTag || view.hidden || view.alpha < 0.05) return;
         BOOL glyph = ([view isKindOfClass:[UILabel class]] && ((UILabel *)view).text.length > 0) ||
                      ([view isKindOfClass:[UIImageView class]] && ((UIImageView *)view).image != nil);
         if (glyph) {
@@ -357,6 +305,148 @@ static CGRect chromeBounds(UIView *bar) {
     };
     recurse(bar);
     return box;
+}
+
+static NSMutableSet<NSString *> *hiddenTabs(void) {
+    NSArray *stored = [[NSUserDefaults standardUserDefaults] arrayForKey:kHiddenKey];
+    return [NSMutableSet setWithArray:stored ?: @[]];
+}
+
+static void saveHidden(NSSet<NSString *> *set) {
+    [[NSUserDefaults standardUserDefaults] setObject:set.allObjects forKey:kHiddenKey];
+}
+
+static NSMutableArray<NSString *> *extraTabs(void) {
+    NSArray *stored = [[NSUserDefaults standardUserDefaults] arrayForKey:kExtraKey];
+    return [NSMutableArray arrayWithArray:stored ?: @[]];
+}
+
+static void saveExtras(NSArray<NSString *> *tabs) {
+    [[NSUserDefaults standardUserDefaults] setObject:tabs forKey:kExtraKey];
+}
+
+static void openFavorites(void);
+
+@interface SMFavoritesTab : UIControl
+@end
+
+@implementation SMFavoritesTab
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (!self) return nil;
+    self.tag = kExtraTag;
+    UIImageView *icon = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"bookmark.fill"]];
+    icon.tag = 1;
+    icon.contentMode = UIViewContentModeScaleAspectFit;
+    [self addSubview:icon];
+    UILabel *title = [[UILabel alloc] init];
+    title.tag = 2;
+    title.text = kFavoritesTitle;
+    title.font = [UIFont systemFontOfSize:10];
+    title.textAlignment = NSTextAlignmentCenter;
+    [self addSubview:title];
+    [self addTarget:self action:@selector(tapped) forControlEvents:UIControlEventTouchUpInside];
+    return self;
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    UIColor *color = [UIColor secondaryLabelColor];
+    ((UIImageView *)[self viewWithTag:1]).tintColor = color;
+    UILabel *title = (UILabel *)[self viewWithTag:2];
+    title.textColor = color;
+    BOOL labels = showLabels();
+    title.hidden = !labels;
+    CGFloat iconSize = 26;
+    CGFloat iconY = labels ? 4 : (self.bounds.size.height - iconSize) / 2.0;
+    [self viewWithTag:1].frame = CGRectMake((self.bounds.size.width - iconSize) / 2.0, iconY, iconSize, iconSize);
+    title.frame = CGRectMake(0, iconY + iconSize + 1, self.bounds.size.width, 14);
+}
+
+- (void)tapped {
+    openFavorites();
+}
+
+@end
+
+static void layoutDockSlots(UIView *bar) {
+    NSSet *hidden = hiddenTabs();
+    NSArray<NSString *> *extras = extraTabs();
+    NSMutableArray<UIView *> *visible = [NSMutableArray array];
+    for (UIView *item in tabItems(bar)) {
+        NSString *title = titleOfItem(item);
+        BOOL hide = title.length && [hidden containsObject:title];
+        item.hidden = hide;
+        item.alpha = hide ? 0 : 1;
+        item.userInteractionEnabled = !hide;
+        if (!hide) [visible addObject:item];
+    }
+    SMFavoritesTab *extra = (SMFavoritesTab *)[bar viewWithTag:kExtraTag];
+    BOOL wantExtra = [extras containsObject:kFavoritesTitle];
+    if (wantExtra && !extra) {
+        extra = [[SMFavoritesTab alloc] initWithFrame:CGRectZero];
+        [bar addSubview:extra];
+    } else if (!wantExtra && extra) {
+        [extra removeFromSuperview];
+        extra = nil;
+    }
+    if (hidden.count == 0 && !wantExtra && savedOrder().count == 0) return;
+
+    NSArray<NSString *> *order = savedOrder();
+    NSMutableArray<UIView *> *arranged = [NSMutableArray array];
+    NSMutableSet *used = [NSMutableSet set];
+    if (order.count) {
+        for (NSString *title in order) {
+            if ([title isEqualToString:kFavoritesTitle]) continue;
+            for (UIView *item in visible) {
+                if ([used containsObject:item]) continue;
+                if ([titleOfItem(item) isEqualToString:title]) {
+                    [arranged addObject:item];
+                    [used addObject:item];
+                    break;
+                }
+            }
+        }
+    }
+    for (UIView *item in visible) {
+        if (![used containsObject:item]) [arranged addObject:item];
+    }
+    NSMutableArray<NSString *> *slots = [NSMutableArray array];
+    if (order.count) {
+        for (NSString *title in order) {
+            if ([title isEqualToString:kFavoritesTitle]) {
+                if (wantExtra) [slots addObject:title];
+            } else if (![hidden containsObject:title]) {
+                [slots addObject:title];
+            }
+        }
+    }
+    for (UIView *item in arranged) {
+        NSString *title = titleOfItem(item);
+        if (title.length && ![slots containsObject:title]) [slots addObject:title];
+    }
+    if (wantExtra && ![slots containsObject:kFavoritesTitle]) [slots addObject:kFavoritesTitle];
+    if (slots.count == 0) return;
+
+    CGFloat width = bar.bounds.size.width;
+    CGFloat slot = width / slots.count;
+    CGFloat y = arranged.firstObject ? arranged.firstObject.center.y : CGRectGetMidY(bar.bounds);
+    NSUInteger itemIndex = 0;
+    for (NSUInteger i = 0; i < slots.count; i++) {
+        CGFloat x = slot * (i + 0.5);
+        if ([slots[i] isEqualToString:kFavoritesTitle]) {
+            extra.bounds = CGRectMake(0, 0, slot - 4, 48);
+            extra.center = CGPointMake(x, y);
+            [extra setNeedsLayout];
+        } else if (itemIndex < arranged.count) {
+            UIView *item = arranged[itemIndex++];
+            CGPoint center = item.center;
+            center.x = x;
+            item.center = center;
+            y = center.y;
+        }
+    }
 }
 
 static UIVisualEffect *makeGlass(void) {
@@ -376,7 +466,7 @@ static UIVisualEffect *makeGlass(void) {
 static void styleTabBar(UIView *bar) {
     if (!isBottomBar(bar)) return;
     applyLabels(bar);
-    applyOrder(bar);
+    layoutDockSlots(bar);
 
     BOOL floating = floatingDock();
     bar.transform = CGAffineTransformIdentity;
@@ -401,17 +491,11 @@ static void styleTabBar(UIView *bar) {
     }
 
     CGRect glyphs = chromeBounds(bar);
+    if (CGRectIsNull(glyphs) && extraTabs().count == 0) return;
     CGFloat side = 18;
-    CGFloat height = 54;
-    CGFloat y = 4;
-    if (showLabels()) {
-        if (CGRectIsNull(glyphs)) return;
-        height = MAX(56, CGRectGetHeight(glyphs) + 18);
-        y = CGRectGetMidY(glyphs) - height / 2.0;
-    } else {
-        CGFloat band = bar.bounds.size.height > 70 ? 49 : bar.bounds.size.height;
-        y = MAX(2, (band - height) / 2.0);
-    }
+    CGFloat padY = showLabels() ? 9 : 11;
+    CGFloat height = CGRectIsNull(glyphs) ? 54 : MAX(showLabels() ? 56 : 46, CGRectGetHeight(glyphs) + padY * 2);
+    CGFloat y = CGRectIsNull(glyphs) ? 4 : CGRectGetMidY(glyphs) - height / 2.0;
     if (y < 2) y = 2;
     if (y + height > bar.bounds.size.height - 2) y = MAX(2, bar.bounds.size.height - 2 - height);
     CGRect frame = CGRectMake(side, y, bar.bounds.size.width - side * 2, height);
@@ -462,8 +546,6 @@ static void styleTabBar(UIView *bar) {
         glass.layer.cornerCurve = kCACornerCurveCircular;
     }
     [bar sendSubviewToBack:pill];
-    pinIconsToPill(bar);
-    scheduleIconPin(bar);
 }
 
 static UIView *locateBar(void) {
@@ -488,12 +570,60 @@ static void styleAllBars(void) {
     if (bar) styleTabBar(bar);
 }
 
+static void activateControl(UIView *view) {
+    UIControl *control = [view isKindOfClass:[UIControl class]] ? (UIControl *)view : nil;
+    UIView *cursor = view;
+    while (!control && cursor.superview) {
+        cursor = cursor.superview;
+        if ([cursor isKindOfClass:[UIControl class]]) control = (UIControl *)cursor;
+    }
+    [control sendActionsForControlEvents:UIControlEventTouchUpInside];
+}
+
+static UIView *findFavoritesChip(void) {
+    for (UIWindow *window in allWindows()) {
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:window];
+        while (stack.count) {
+            UIView *view = stack.lastObject;
+            [stack removeLastObject];
+            if (view.tag == kExtraTag || [view isKindOfClass:[SMFavoritesTab class]]) continue;
+            if ([view isKindOfClass:[UILabel class]]) {
+                UILabel *label = (UILabel *)view;
+                if ([label.text isEqualToString:kFavoritesTitle] || [label.text isEqualToString:@"Избранные"]) {
+                    CGRect frame = [label convertRect:label.bounds toView:window];
+                    if (CGRectIntersectsRect(frame, window.bounds) && CGRectGetMinY(frame) < window.bounds.size.height * 0.42) {
+                        return label;
+                    }
+                }
+            }
+            [stack addObjectsFromArray:view.subviews];
+        }
+    }
+    return nil;
+}
+
+static void openFavorites(void) {
+    UIView *bar = locateBar();
+    for (UIView *item in tabItems(bar)) {
+        NSString *title = titleOfItem(item);
+        if ([title isEqualToString:@"Чаты"] || [title isEqualToString:@"Chats"]) {
+            activateControl(item);
+            break;
+        }
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        UIView *chip = findFavoritesChip();
+        if (chip) activateControl(chip);
+    });
+}
+
 @interface SMDockEntry : UIControl
 @property (nonatomic, weak) UIViewController *owner;
 @end
 
 @interface SMDockEditor : UITableViewController
 @property (nonatomic, strong) NSMutableArray<NSString *> *titles;
+@property (nonatomic, strong) NSMutableArray<NSString *> *catalog;
 @end
 
 static void presentEditor(UIViewController *from);
@@ -563,6 +693,7 @@ static void presentEditor(UIViewController *from);
     self.tableView.editing = YES;
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(done)];
     if (!self.titles) self.titles = [NSMutableArray array];
+    if (!self.catalog) self.catalog = [NSMutableArray array];
 }
 
 - (void)done {
@@ -582,19 +713,24 @@ static void presentEditor(UIViewController *from);
     styleAllBars();
 }
 
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 2; }
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 3; }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return section == 0 ? 3 : self.titles.count;
+    if (section == 0) return 3;
+    if (section == 1) return self.titles.count;
+    return self.catalog.count;
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
-    return section == 0 ? @"Опции" : @"Порядок";
+    if (section == 0) return @"Опции";
+    if (section == 1) return @"В доке";
+    return @"Добавить";
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     if (section == 0) return @"Жидкое стекло включает оформление iOS 26 во всём приложении. Закройте MAX и откройте снова, чтобы оно применилось.";
-    return @"Удерживайте полоски справа и перетаскивайте вкладки.";
+    if (section == 1) return @"Минус убирает вкладку. Полоски справа меняют порядок.";
+    return @"Нажмите «Избранное», чтобы добавить вкладку избранных чатов.";
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -629,9 +765,14 @@ static void presentEditor(UIViewController *from);
         toggle.hidden = NO;
         toggle.on = on;
         objc_setAssociatedObject(toggle, "sm_row", @(indexPath.row), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    } else {
+    } else if (indexPath.section == 1) {
         cell.textLabel.text = self.titles[indexPath.row];
         toggle.hidden = YES;
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+    } else {
+        cell.textLabel.text = self.catalog[indexPath.row];
+        toggle.hidden = YES;
+        cell.selectionStyle = UITableViewCellSelectionStyleDefault;
     }
     return cell;
 }
@@ -654,11 +795,50 @@ static void presentEditor(UIViewController *from);
 }
 
 - (UITableViewCellEditingStyle)tableView:(UITableView *)tableView editingStyleForRowAtIndexPath:(NSIndexPath *)indexPath {
-    return UITableViewCellEditingStyleNone;
+    return indexPath.section == 1 && self.titles.count > 1 ? UITableViewCellEditingStyleDelete : UITableViewCellEditingStyleNone;
 }
 
 - (BOOL)tableView:(UITableView *)tableView shouldIndentWhileEditingRowAtIndexPath:(NSIndexPath *)indexPath {
-    return NO;
+    return indexPath.section == 1;
+}
+
+- (void)tableView:(UITableView *)tableView commitEditingStyle:(UITableViewCellEditingStyle)editingStyle forRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (editingStyle != UITableViewCellEditingStyleDelete || indexPath.section != 1) return;
+    NSString *title = self.titles[indexPath.row];
+    [self.titles removeObjectAtIndex:indexPath.row];
+    if ([title isEqualToString:kFavoritesTitle]) {
+        NSMutableArray *extras = extraTabs();
+        [extras removeObject:title];
+        saveExtras(extras);
+    } else {
+        NSMutableSet *hidden = hiddenTabs();
+        [hidden addObject:title];
+        saveHidden(hidden);
+    }
+    if (![self.catalog containsObject:title]) [self.catalog addObject:title];
+    saveOrder(self.titles);
+    [tableView reloadData];
+    styleAllBars();
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (indexPath.section != 2) return;
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    NSString *title = self.catalog[indexPath.row];
+    [self.catalog removeObjectAtIndex:indexPath.row];
+    [self.titles addObject:title];
+    if ([title isEqualToString:kFavoritesTitle]) {
+        NSMutableArray *extras = extraTabs();
+        if (![extras containsObject:title]) [extras addObject:title];
+        saveExtras(extras);
+    } else {
+        NSMutableSet *hidden = hiddenTabs();
+        [hidden removeObject:title];
+        saveHidden(hidden);
+    }
+    saveOrder(self.titles);
+    [tableView reloadData];
+    styleAllBars();
 }
 
 @end
@@ -675,14 +855,36 @@ static UIViewController *topController(void) {
 static void presentEditor(UIViewController *from) {
     if (!from) from = topController();
     if (!from) return;
-    NSMutableArray *titles = [NSMutableArray array];
+    NSSet *hidden = hiddenTabs();
+    NSArray *extras = extraTabs();
+    NSMutableArray *pool = [NSMutableArray array];
     for (UIView *item in tabItems(locateBar())) {
         NSString *title = titleOfItem(item);
-        if (title.length) [titles addObject:title];
+        if (title.length && ![pool containsObject:title]) [pool addObject:title];
     }
-    if (titles.count == 0 && savedOrder().count) titles = [savedOrder() mutableCopy];
+    if (pool.count == 0) [pool addObjectsFromArray:@[@"Контакты", @"Звонки", @"Чаты", @"Настройки"]];
+    NSMutableArray *titles = [NSMutableArray array];
+    for (NSString *title in savedOrder()) {
+        if ([title isEqualToString:kFavoritesTitle]) {
+            if ([extras containsObject:title]) [titles addObject:title];
+        } else if ([pool containsObject:title] && ![hidden containsObject:title] && ![titles containsObject:title]) {
+            [titles addObject:title];
+        }
+    }
+    for (NSString *title in pool) {
+        if (![hidden containsObject:title] && ![titles containsObject:title]) [titles addObject:title];
+    }
+    for (NSString *title in extras) {
+        if (![titles containsObject:title]) [titles addObject:title];
+    }
+    NSMutableArray *catalog = [NSMutableArray array];
+    for (NSString *title in pool) {
+        if ([hidden containsObject:title]) [catalog addObject:title];
+    }
+    if (![extras containsObject:kFavoritesTitle]) [catalog addObject:kFavoritesTitle];
     SMDockEditor *editor = [[SMDockEditor alloc] init];
     editor.titles = titles;
+    editor.catalog = catalog;
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:editor];
     nav.modalPresentationStyle = UIModalPresentationPageSheet;
     nav.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
