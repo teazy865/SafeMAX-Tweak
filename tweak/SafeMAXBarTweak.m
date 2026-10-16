@@ -112,7 +112,7 @@ static void applyToAllTabBars(void) {
 // Simple editor VC
 @interface SafeMAXDockEditor : UITableViewController
 @property (nonatomic, strong) NSMutableArray<UITabBarItem *> *items;
-@property (nonatomic, weak) UITabBar *tabBar;
+@property (nonatomic, assign) UITabBar *tabBar; // assign instead of weak for MRC
 @end
 
 @implementation SafeMAXDockEditor
@@ -125,7 +125,6 @@ static void applyToAllTabBars(void) {
 }
 
 - (void)done {
-    // Save current order as indices relative to original if possible
     [self dismissViewControllerAnimated:YES completion:nil];
     applyToAllTabBars();
 }
@@ -184,7 +183,6 @@ static void applyToAllTabBars(void) {
     [self.items removeObjectAtIndex:sourceIndexPath.row];
     [self.items insertObject:item atIndex:destinationIndexPath.row];
 
-    // Persist order as current indices
     NSMutableArray *order = [NSMutableArray array];
     for (NSUInteger i = 0; i < self.items.count; i++) [order addObject:@(i)];
     saveOrder(order);
@@ -247,7 +245,6 @@ static void swizzled_viewDidAppear(id self, SEL _cmd, BOOL animated) {
 
         objc_setAssociatedObject(tv, "safeMAXRowInjected", @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-        // Add a floating button as reliable injection (table injection is fragile without knowing data source)
         UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
         [btn setTitle:@"Редактировать док" forState:UIControlStateNormal];
         btn.backgroundColor = [UIColor colorWithWhite:0.18 alpha:0.95];
@@ -285,5 +282,3 @@ static void init(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ applyToAllTabBars(); });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ applyToAllTabBars(); });
 }
-
-@end
