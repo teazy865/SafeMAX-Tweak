@@ -166,6 +166,46 @@ static void applyLabels(UIView *bar) {
     });
 }
 
+static UIImageView *largestIcon(UIView *item) {
+    __block UIImageView *best = nil;
+    __block CGFloat bestArea = 0;
+    __block void (^walk)(UIView *);
+    walk = ^(UIView *view) {
+        if (!view || view.tag == kPillTag || view.hidden) return;
+        if ([view isKindOfClass:[UIImageView class]] && ((UIImageView *)view).image) {
+            CGFloat area = view.bounds.size.width * view.bounds.size.height;
+            if (area > bestArea) {
+                best = (UIImageView *)view;
+                bestArea = area;
+            }
+        }
+        for (UIView *sub in view.subviews) walk(sub);
+    };
+    walk(item);
+    return best;
+}
+
+static void alignIcons(UIView *bar) {
+    BOOL labelsOn = showLabels();
+    for (UIView *item in tabItems(bar)) {
+        UIImageView *icon = largestIcon(item);
+        if (!icon.superview) continue;
+        if (labelsOn) {
+            NSValue *saved = objc_getAssociatedObject(icon, "sm_iconCenter");
+            if (saved) {
+                icon.center = saved.CGPointValue;
+                objc_setAssociatedObject(icon, "sm_iconCenter", nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+            continue;
+        }
+        if (!objc_getAssociatedObject(icon, "sm_iconCenter")) {
+            objc_setAssociatedObject(icon, "sm_iconCenter", [NSValue valueWithCGPoint:icon.center], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        CGPoint mid = [item convertPoint:CGPointMake(CGRectGetMidX(item.bounds), CGRectGetMidY(item.bounds)) toView:icon.superview];
+        icon.center = mid;
+    }
+}
+
 static void applyOrder(UIView *bar) {
     NSArray<NSString *> *order = savedOrder();
     if (order.count == 0) return;
@@ -255,15 +295,31 @@ static void clearEffect(UIView *view, BOOL clear) {
     }
 }
 
+static BOOL isFullPlate(UIView *sub, UIView *host) {
+    if (sub.bounds.size.width < host.bounds.size.width * 0.75) return NO;
+    if (sub.bounds.size.height < host.bounds.size.height * 0.45) return NO;
+    if ([sub isKindOfClass:[UIImageView class]] || [sub isKindOfClass:[UILabel class]] || [sub isKindOfClass:[UIControl class]]) return NO;
+    return !viewHasChrome(sub);
+}
+
 static void stripBackdrops(UIView *view, BOOL floating) {
     for (UIView *sub in view.subviews) {
         if (sub.tag == kPillTag) continue;
         if (viewHasChrome(sub)) {
-            clearFill(sub, floating);
-            clearEffect(sub, floating);
+            // Never fade a view that holds an icon. The tab-switch animation
+            // swaps those views, and forcing alpha to 0 blanks the icon.
+            setBackdropHidden(sub, NO);
+            BOOL plate = sub.bounds.size.width > view.bounds.size.width * 0.8 &&
+                         sub.bounds.size.height > view.bounds.size.height * 0.7;
+            if (plate) {
+                clearFill(sub, floating);
+                clearEffect(sub, floating);
+            }
             stripBackdrops(sub, floating);
+        } else if (floating && isFullPlate(sub, view)) {
+            setBackdropHidden(sub, YES);
         } else {
-            setBackdropHidden(sub, floating);
+            setBackdropHidden(sub, NO);
         }
     }
 }
@@ -304,6 +360,7 @@ static UIVisualEffect *makeGlass(void) {
 static void styleTabBar(UIView *bar) {
     if (!isBottomBar(bar)) return;
     applyLabels(bar);
+    alignIcons(bar);
     applyOrder(bar);
 
     BOOL floating = floatingDock();
