@@ -8,16 +8,10 @@
 
 static NSString *const kShowLabelsKey = @"SafeMAX_ShowLabels";
 static NSString *const kFloatingKey = @"SafeMAX_FloatingDock";
-static NSString *const kGlassKey = @"SafeMAX_LiquidGlass";
 static NSString *const kOrderKey = @"SafeMAX_TabOrder";
-static NSString *const kHiddenKey = @"SafeMAX_HiddenTabs";
-static NSString *const kExtraKey = @"SafeMAX_ExtraTabs";
-static NSString *const kFavoritesTitle = @"Избранное";
 
 static const NSInteger kEntryTag = 0x5AF1;
 static const NSInteger kPillTag = 0x5AF3;
-static const NSInteger kExtraTag = 0x5AF4;
-static const NSInteger kSelectTag = 0x5AF6;
 
 static Class TabBarClass;
 static Class SettingsClass;
@@ -29,11 +23,6 @@ static BOOL g_inSettings;
 
 static BOOL showLabels(void) {
     id obj = [[NSUserDefaults standardUserDefaults] objectForKey:kShowLabelsKey];
-    return obj ? [obj boolValue] : YES;
-}
-
-static BOOL liquidGlass(void) {
-    id obj = [[NSUserDefaults standardUserDefaults] objectForKey:kGlassKey];
     return obj ? [obj boolValue] : YES;
 }
 
@@ -171,6 +160,46 @@ static void applyLabels(UIView *bar) {
     });
 }
 
+static UIImageView *largestIcon(UIView *item) {
+    __block UIImageView *best = nil;
+    __block CGFloat bestArea = 0;
+    __block void (^walk)(UIView *);
+    walk = ^(UIView *view) {
+        if (!view || view.tag == kPillTag || view.hidden) return;
+        if ([view isKindOfClass:[UIImageView class]] && ((UIImageView *)view).image) {
+            CGFloat area = view.bounds.size.width * view.bounds.size.height;
+            if (area > bestArea) {
+                best = (UIImageView *)view;
+                bestArea = area;
+            }
+        }
+        for (UIView *sub in view.subviews) walk(sub);
+    };
+    walk(item);
+    return best;
+}
+
+static void alignIcons(UIView *bar) {
+    BOOL labelsOn = showLabels();
+    for (UIView *item in tabItems(bar)) {
+        UIImageView *icon = largestIcon(item);
+        if (!icon.superview) continue;
+        if (labelsOn) {
+            NSValue *saved = objc_getAssociatedObject(icon, "sm_iconCenter");
+            if (saved) {
+                icon.center = saved.CGPointValue;
+                objc_setAssociatedObject(icon, "sm_iconCenter", nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+            continue;
+        }
+        if (!objc_getAssociatedObject(icon, "sm_iconCenter")) {
+            objc_setAssociatedObject(icon, "sm_iconCenter", [NSValue valueWithCGPoint:icon.center], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        CGPoint mid = [item convertPoint:CGPointMake(CGRectGetMidX(item.bounds), CGRectGetMidY(item.bounds)) toView:icon.superview];
+        icon.center = mid;
+    }
+}
+
 static void applyOrder(UIView *bar) {
     NSArray<NSString *> *order = savedOrder();
     if (order.count == 0) return;
@@ -269,7 +298,7 @@ static BOOL isFullPlate(UIView *sub, UIView *host) {
 
 static void stripBackdrops(UIView *view, BOOL floating) {
     for (UIView *sub in view.subviews) {
-        if (sub.tag == kPillTag || sub.tag == kSelectTag) continue;
+        if (sub.tag == kPillTag) continue;
         if (viewHasChrome(sub)) {
             // Never fade a view that holds an icon. The tab-switch animation
             // swaps those views, and forcing alpha to 0 blanks the icon.
@@ -293,7 +322,7 @@ static CGRect chromeBounds(UIView *bar) {
     __block CGRect box = CGRectNull;
     __block void (^recurse)(UIView *);
     recurse = ^(UIView *view) {
-        if (!view || view.tag == kPillTag || view.tag == kSelectTag || view.tag == kExtraTag || view.hidden || view.alpha < 0.05) return;
+        if (!view || view.tag == kPillTag || view.hidden || view.alpha < 0.05) return;
         BOOL glyph = ([view isKindOfClass:[UILabel class]] && ((UILabel *)view).text.length > 0) ||
                      ([view isKindOfClass:[UIImageView class]] && ((UIImageView *)view).image != nil);
         if (glyph) {
@@ -306,198 +335,6 @@ static CGRect chromeBounds(UIView *bar) {
     };
     recurse(bar);
     return box;
-}
-
-static NSMutableSet<NSString *> *hiddenTabs(void) {
-    NSArray *stored = [[NSUserDefaults standardUserDefaults] arrayForKey:kHiddenKey];
-    return [NSMutableSet setWithArray:stored ?: @[]];
-}
-
-static void saveHidden(NSSet<NSString *> *set) {
-    [[NSUserDefaults standardUserDefaults] setObject:set.allObjects forKey:kHiddenKey];
-}
-
-static NSMutableArray<UIView *> *visibleDockItems(UIView *bar) {
-    NSSet *hidden = hiddenTabs();
-    NSMutableArray<UIView *> *visible = [NSMutableArray array];
-    for (UIView *item in tabItems(bar)) {
-        NSString *title = titleOfItem(item);
-        BOOL hide = title.length && [hidden containsObject:title];
-        item.hidden = hide;
-        item.alpha = hide ? 0 : 1;
-        item.userInteractionEnabled = !hide;
-        if (!hide) [visible addObject:item];
-    }
-    NSArray<NSString *> *order = savedOrder();
-    if (order.count == 0) return visible;
-    NSMutableArray<UIView *> *arranged = [NSMutableArray array];
-    NSMutableSet *used = [NSMutableSet set];
-    for (NSString *title in order) {
-        for (UIView *item in visible) {
-            if ([used containsObject:item]) continue;
-            if ([titleOfItem(item) isEqualToString:title]) {
-                [arranged addObject:item];
-                [used addObject:item];
-                break;
-            }
-        }
-    }
-    for (UIView *item in visible) {
-        if (![used containsObject:item]) [arranged addObject:item];
-    }
-    return arranged;
-}
-
-static void layoutDockSlots(UIView *bar) {
-    [[bar viewWithTag:kExtraTag] removeFromSuperview];
-    NSArray<UIView *> *items = visibleDockItems(bar);
-    if (items.count == 0) return;
-    CGFloat side = floatingDock() ? 18 : 0;
-    CGFloat width = MAX(1, bar.bounds.size.width - side * 2);
-    CGFloat slot = width / items.count;
-    for (NSUInteger i = 0; i < items.count; i++) {
-        UIView *item = items[i];
-        CGPoint center = item.center;
-        center.x = side + slot * (i + 0.5);
-        item.center = center;
-    }
-}
-
-static UIVisualEffect *makeGlass(void);
-static void shapeGlass(UIView *view);
-
-static CGFloat accentScore(UIColor *color) {
-    if (!color) return 0;
-    CGFloat r = 0, g = 0, b = 0, a = 0;
-    if (![color getRed:&r green:&g blue:&b alpha:&a]) return 0;
-    return (b + r * 0.15) - g;
-}
-
-static UIView *selectedDockItem(NSArray<UIView *> *items) {
-    UIView *best = items.firstObject;
-    CGFloat bestScore = -100;
-    for (UIView *item in items) {
-        __block CGFloat score = 0;
-        eachLabel(item, ^(UILabel *label) {
-            score = MAX(score, accentScore(label.textColor));
-        });
-        if (score > bestScore) {
-            bestScore = score;
-            best = item;
-        }
-    }
-    return best;
-}
-
-static void placeSelection(UIView *bar, UIView *forced, BOOL dragging) {
-    NSArray<UIView *> *items = visibleDockItems(bar);
-    if (items.count == 0) return;
-    UIView *item = forced ?: selectedDockItem(items);
-    if (!item) return;
-    UIVisualEffectView *mark = (UIVisualEffectView *)[bar viewWithTag:kSelectTag];
-    if (![mark isKindOfClass:[UIVisualEffectView class]]) {
-        [mark removeFromSuperview];
-        mark = [[UIVisualEffectView alloc] initWithEffect:nil];
-        mark.tag = kSelectTag;
-        mark.userInteractionEnabled = NO;
-        mark.clipsToBounds = YES;
-        [bar addSubview:mark];
-    }
-    UIView *pill = [bar viewWithTag:kPillTag];
-    if (pill) [bar insertSubview:mark aboveSubview:pill];
-    else [bar sendSubviewToBack:mark];
-
-    CGRect host = pill ? pill.frame : CGRectInset(bar.bounds, 8, 4);
-    CGRect itemFrame = [item convertRect:item.bounds toView:bar];
-    CGFloat count = MAX(1, items.count);
-    CGFloat slot = CGRectGetWidth(host) / count;
-    CGFloat height = MAX(36, CGRectGetHeight(host) - 8);
-    CGFloat width = MAX(height * 0.9, slot - 8);
-    CGFloat x = CGRectGetMidX(itemFrame) - width / 2.0;
-    CGFloat minX = CGRectGetMinX(host) + 4;
-    CGFloat maxX = CGRectGetMaxX(host) - 4 - width;
-    if (maxX < minX) maxX = minX;
-    if (x < minX) x = minX;
-    if (x > maxX) x = maxX;
-    CGFloat y = CGRectGetMidY(host) - height / 2.0;
-    CGRect frame = CGRectMake(x, y, width, height);
-    BOOL glass = dragging && liquidGlass();
-    void (^apply)(void) = ^{
-        mark.frame = frame;
-        mark.layer.cornerCurve = kCACornerCurveContinuous;
-        if (glass) {
-            mark.clipsToBounds = NO;
-            mark.layer.masksToBounds = NO;
-            mark.layer.cornerRadius = 0;
-            mark.backgroundColor = [UIColor clearColor];
-            mark.effect = makeGlass();
-            shapeGlass(mark);
-        } else {
-            mark.clipsToBounds = YES;
-            mark.layer.cornerRadius = MIN(26, height / 2.0);
-            mark.effect = nil;
-            BOOL dark = bar.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark;
-            mark.backgroundColor = [UIColor colorWithWhite:dark ? 1 : 0 alpha:dark ? 0.16 : 0.08];
-        }
-    };
-    if (dragging) {
-        [UIView animateWithDuration:0.22 delay:0 usingSpringWithDamping:0.86 initialSpringVelocity:0.4 options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction animations:apply completion:nil];
-    } else {
-        apply();
-    }
-}
-
-@interface SMDragRelay : NSObject
-@end
-
-@implementation SMDragRelay
-
-- (void)pressed:(UILongPressGestureRecognizer *)gesture {
-    UIView *bar = gesture.view;
-    if (![bar isKindOfClass:[UIView class]]) return;
-    NSArray<UIView *> *items = visibleDockItems(bar);
-    if (items.count == 0) return;
-    CGPoint point = [gesture locationInView:bar];
-    UIView *hit = items.firstObject;
-    CGFloat best = CGFLOAT_MAX;
-    for (UIView *item in items) {
-        CGFloat distance = fabs(CGRectGetMidX([item convertRect:item.bounds toView:bar]) - point.x);
-        if (distance < best) {
-            best = distance;
-            hit = item;
-        }
-    }
-    BOOL dragging = gesture.state == UIGestureRecognizerStateBegan || gesture.state == UIGestureRecognizerStateChanged;
-    placeSelection(bar, hit, dragging);
-    if (dragging) {
-        NSString *title = titleOfItem(hit);
-        NSString *last = objc_getAssociatedObject(bar, "sm_dragTitle");
-        if (title.length && ![title isEqualToString:last]) {
-            objc_setAssociatedObject(bar, "sm_dragTitle", title, OBJC_ASSOCIATION_COPY_NONATOMIC);
-            UIControl *control = [hit isKindOfClass:[UIControl class]] ? (UIControl *)hit : nil;
-            UIView *cursor = hit;
-            while (!control && cursor.superview && cursor.superview != bar) {
-                cursor = cursor.superview;
-                if ([cursor isKindOfClass:[UIControl class]]) control = (UIControl *)cursor;
-            }
-            [control sendActionsForControlEvents:UIControlEventTouchUpInside];
-        }
-    } else {
-        objc_setAssociatedObject(bar, "sm_dragTitle", nil, OBJC_ASSOCIATION_ASSIGN);
-    }
-}
-
-@end
-
-static void installDrag(UIView *bar) {
-    if (objc_getAssociatedObject(bar, "sm_drag")) return;
-    SMDragRelay *relay = [SMDragRelay new];
-    UILongPressGestureRecognizer *gesture = [[UILongPressGestureRecognizer alloc] initWithTarget:relay action:@selector(pressed:)];
-    gesture.minimumPressDuration = 0.12;
-    gesture.cancelsTouchesInView = NO;
-    gesture.delaysTouchesBegan = NO;
-    [bar addGestureRecognizer:gesture];
-    objc_setAssociatedObject(bar, "sm_drag", relay, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 static UIVisualEffect *makeGlass(void) {
@@ -514,25 +351,11 @@ static UIVisualEffect *makeGlass(void) {
     return [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterial];
 }
 
-// layer.cornerRadius flattens UIGlassEffect into a solid fill. The system capsule
-// shape has to come from UICornerConfiguration, which leaves the material intact.
-static void shapeGlass(UIView *view) {
-    view.clipsToBounds = NO;
-    view.layer.masksToBounds = NO;
-    view.layer.cornerRadius = 0;
-    view.backgroundColor = [UIColor clearColor];
-    Class cfg = NSClassFromString(@"UICornerConfiguration");
-    SEL capsule = NSSelectorFromString(@"capsuleConfiguration");
-    SEL setter = NSSelectorFromString(@"setCornerConfiguration:");
-    if (!cfg || ![cfg respondsToSelector:capsule] || ![view respondsToSelector:setter]) return;
-    id shape = ((id (*)(Class, SEL))objc_msgSend)(cfg, capsule);
-    if (shape) ((void (*)(id, SEL, id))objc_msgSend)(view, setter, shape);
-}
-
 static void styleTabBar(UIView *bar) {
     if (!isBottomBar(bar)) return;
     applyLabels(bar);
-    layoutDockSlots(bar);
+    alignIcons(bar);
+    applyOrder(bar);
 
     BOOL floating = floatingDock();
     bar.transform = CGAffineTransformIdentity;
@@ -553,20 +376,15 @@ static void styleTabBar(UIView *bar) {
     UIView *pill = [bar viewWithTag:kPillTag];
     if (!floating) {
         [pill removeFromSuperview];
-        [[bar viewWithTag:kSelectTag] removeFromSuperview];
         return;
     }
 
-    installDrag(bar);
     CGRect glyphs = chromeBounds(bar);
-    if (CGRectIsNull(glyphs)) {
-        if (!objc_getAssociatedObject(bar, "sm_dragTitle")) placeSelection(bar, nil, NO);
-        return;
-    }
+    if (CGRectIsNull(glyphs)) return;
     CGFloat side = 18;
-    CGFloat padY = showLabels() ? 9 : 11;
-    CGFloat height = CGRectIsNull(glyphs) ? 54 : MAX(showLabels() ? 56 : 46, CGRectGetHeight(glyphs) + padY * 2);
-    CGFloat y = CGRectIsNull(glyphs) ? 4 : CGRectGetMidY(glyphs) - height / 2.0;
+    CGFloat padY = 9;
+    CGFloat height = MAX(56, CGRectGetHeight(glyphs) + padY * 2);
+    CGFloat y = CGRectGetMidY(glyphs) - height / 2.0;
     if (y < 2) y = 2;
     if (y + height > bar.bounds.size.height - 2) y = MAX(2, bar.bounds.size.height - 2 - height);
     CGRect frame = CGRectMake(side, y, bar.bounds.size.width - side * 2, height);
@@ -592,32 +410,13 @@ static void styleTabBar(UIView *bar) {
     pill.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:pill.bounds cornerRadius:height / 2.0].CGPath;
     UIVisualEffectView *glass = (UIVisualEffectView *)[pill viewWithTag:7];
     glass.frame = pill.bounds;
-    NSString *mode = [NSString stringWithFormat:@"%d-%ld", liquidGlass(), (long)bar.traitCollection.userInterfaceStyle];
-    if (![objc_getAssociatedObject(glass, "sm_mode") isEqual:mode]) {
-        objc_setAssociatedObject(glass, "sm_mode", mode, OBJC_ASSOCIATION_COPY_NONATOMIC);
-        if (liquidGlass()) {
-            glass.backgroundColor = [UIColor clearColor];
-            glass.effect = makeGlass();
-            shapeGlass(glass);
-        } else {
-            glass.effect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterial];
-            glass.effect = nil;
-            glass.clipsToBounds = YES;
-            glass.layer.cornerRadius = height / 2.0;
-            if ([glass respondsToSelector:NSSelectorFromString(@"setCornerConfiguration:")]) {
-                ((void (*)(id, SEL, id))objc_msgSend)(glass, NSSelectorFromString(@"setCornerConfiguration:"), nil);
-            }
-            glass.backgroundColor = [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *trait) {
-                return trait.userInterfaceStyle == UIUserInterfaceStyleDark
-                    ? [UIColor colorWithWhite:0.07 alpha:0.94]
-                    : [UIColor colorWithWhite:1 alpha:0.94];
-            }];
-        }
-    }
-    if (liquidGlass()) shapeGlass(glass);
+    glass.backgroundColor = [UIColor clearColor];
+    glass.clipsToBounds = NO;
+    glass.layer.cornerRadius = 0;
+    glass.effect = makeGlass();
+    glass.layer.cornerRadius = height / 2.0;
+    glass.layer.cornerCurve = kCACornerCurveCircular;
     [bar sendSubviewToBack:pill];
-    installDrag(bar);
-    if (!objc_getAssociatedObject(bar, "sm_dragTitle")) placeSelection(bar, nil, NO);
 }
 
 static UIView *locateBar(void) {
@@ -642,23 +441,12 @@ static void styleAllBars(void) {
     if (bar) styleTabBar(bar);
 }
 
-static void activateControl(UIView *view) {
-    UIControl *control = [view isKindOfClass:[UIControl class]] ? (UIControl *)view : nil;
-    UIView *cursor = view;
-    while (!control && cursor.superview) {
-        cursor = cursor.superview;
-        if ([cursor isKindOfClass:[UIControl class]]) control = (UIControl *)cursor;
-    }
-    [control sendActionsForControlEvents:UIControlEventTouchUpInside];
-}
-
 @interface SMDockEntry : UIControl
 @property (nonatomic, weak) UIViewController *owner;
 @end
 
 @interface SMDockEditor : UITableViewController
 @property (nonatomic, strong) NSMutableArray<NSString *> *titles;
-@property (nonatomic, strong) NSMutableArray<NSString *> *catalog;
 @end
 
 static void presentEditor(UIViewController *from);
@@ -699,11 +487,12 @@ static void presentEditor(UIViewController *from);
     UIColor *foreground = [UIColor labelColor];
     self.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
     ((UIImageView *)[self viewWithTag:1]).tintColor = foreground;
-    ((UILabel *)[self viewWithTag:2]).textColor = foreground;
+    UILabel *title = (UILabel *)[self viewWithTag:2];
+    title.textColor = foreground;
     ((UIImageView *)[self viewWithTag:4]).tintColor = [UIColor tertiaryLabelColor];
     [self viewWithTag:1].frame = CGRectMake(16, (self.bounds.size.height - 24) / 2.0, 24, 24);
     [self viewWithTag:4].frame = CGRectMake(self.bounds.size.width - 28, (self.bounds.size.height - 14) / 2.0, 12, 14);
-    [self viewWithTag:2].frame = CGRectMake(56, 0, self.bounds.size.width - 96, self.bounds.size.height);
+    title.frame = CGRectMake(56, 0, self.bounds.size.width - 96, self.bounds.size.height);
 }
 
 - (void)setHighlighted:(BOOL)highlighted {
@@ -728,7 +517,6 @@ static void presentEditor(UIViewController *from);
     self.tableView.editing = YES;
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(done)];
     if (!self.titles) self.titles = [NSMutableArray array];
-    if (!self.catalog) self.catalog = [NSMutableArray array];
 }
 
 - (void)done {
@@ -740,32 +528,24 @@ static void presentEditor(UIViewController *from);
     NSNumber *row = objc_getAssociatedObject(sender, "sm_row");
     if (row.integerValue == 0) {
         [[NSUserDefaults standardUserDefaults] setBool:sender.on forKey:kShowLabelsKey];
-    } else if (row.integerValue == 1) {
-        [[NSUserDefaults standardUserDefaults] setBool:sender.on forKey:kFloatingKey];
     } else {
-        [[NSUserDefaults standardUserDefaults] setBool:sender.on forKey:kGlassKey];
+        [[NSUserDefaults standardUserDefaults] setBool:sender.on forKey:kFloatingKey];
     }
     styleAllBars();
 }
 
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 3; }
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 2; }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    if (section == 0) return 3;
-    if (section == 1) return self.titles.count;
-    return self.catalog.count;
+    return section == 0 ? 2 : self.titles.count;
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
-    if (section == 0) return @"Опции";
-    if (section == 1) return @"В доке";
-    return @"Добавить";
+    return section == 0 ? @"Опции" : @"Порядок";
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
-    if (section == 0) return @"Жидкое стекло включает оформление iOS 26 во всём приложении. Закройте MAX и откройте снова, чтобы оно применилось.";
-    if (section == 1) return @"Минус убирает вкладку. Полоски справа меняют порядок. Оставшиеся иконки стоят симметрично.";
-    return @"Нажмите вкладку, чтобы вернуть её в док.";
+    return section == 1 ? @"Удерживайте полоски справа и перетаскивайте вкладки." : nil;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -776,15 +556,8 @@ static void presentEditor(UIViewController *from);
     cell.selectionStyle = UITableViewCellSelectionStyleNone;
     UISwitch *toggle = [cell.contentView viewWithTag:9];
     if (indexPath.section == 0) {
-        NSString *title = @"Парящий док";
-        BOOL on = floatingDock();
-        if (indexPath.row == 0) {
-            title = @"Текст под иконками";
-            on = showLabels();
-        } else if (indexPath.row == 2) {
-            title = @"Жидкое стекло";
-            on = liquidGlass();
-        }
+        NSString *title = indexPath.row == 0 ? @"Текст под иконками" : @"Парящий док";
+        BOOL on = indexPath.row == 0 ? showLabels() : floatingDock();
         cell.textLabel.text = title;
         if (!toggle) {
             toggle = [[UISwitch alloc] init];
@@ -800,14 +573,9 @@ static void presentEditor(UIViewController *from);
         toggle.hidden = NO;
         toggle.on = on;
         objc_setAssociatedObject(toggle, "sm_row", @(indexPath.row), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    } else if (indexPath.section == 1) {
+    } else {
         cell.textLabel.text = self.titles[indexPath.row];
         toggle.hidden = YES;
-        cell.selectionStyle = UITableViewCellSelectionStyleNone;
-    } else {
-        cell.textLabel.text = self.catalog[indexPath.row];
-        toggle.hidden = YES;
-        cell.selectionStyle = UITableViewCellSelectionStyleDefault;
     }
     return cell;
 }
@@ -830,38 +598,11 @@ static void presentEditor(UIViewController *from);
 }
 
 - (UITableViewCellEditingStyle)tableView:(UITableView *)tableView editingStyleForRowAtIndexPath:(NSIndexPath *)indexPath {
-    return indexPath.section == 1 && self.titles.count > 1 ? UITableViewCellEditingStyleDelete : UITableViewCellEditingStyleNone;
+    return UITableViewCellEditingStyleNone;
 }
 
 - (BOOL)tableView:(UITableView *)tableView shouldIndentWhileEditingRowAtIndexPath:(NSIndexPath *)indexPath {
-    return indexPath.section == 1;
-}
-
-- (void)tableView:(UITableView *)tableView commitEditingStyle:(UITableViewCellEditingStyle)editingStyle forRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (editingStyle != UITableViewCellEditingStyleDelete || indexPath.section != 1) return;
-    NSString *title = self.titles[indexPath.row];
-    [self.titles removeObjectAtIndex:indexPath.row];
-    NSMutableSet *hidden = hiddenTabs();
-    [hidden addObject:title];
-    saveHidden(hidden);
-    if (![self.catalog containsObject:title]) [self.catalog addObject:title];
-    saveOrder(self.titles);
-    [tableView reloadData];
-    styleAllBars();
-}
-
-- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (indexPath.section != 2) return;
-    [tableView deselectRowAtIndexPath:indexPath animated:YES];
-    NSString *title = self.catalog[indexPath.row];
-    [self.catalog removeObjectAtIndex:indexPath.row];
-    [self.titles addObject:title];
-    NSMutableSet *hidden = hiddenTabs();
-    [hidden removeObject:title];
-    saveHidden(hidden);
-    saveOrder(self.titles);
-    [tableView reloadData];
-    styleAllBars();
+    return NO;
 }
 
 @end
@@ -878,29 +619,14 @@ static UIViewController *topController(void) {
 static void presentEditor(UIViewController *from) {
     if (!from) from = topController();
     if (!from) return;
-    NSSet *hidden = hiddenTabs();
-    NSMutableArray *pool = [NSMutableArray array];
+    NSMutableArray *titles = [NSMutableArray array];
     for (UIView *item in tabItems(locateBar())) {
         NSString *title = titleOfItem(item);
-        if (title.length && ![pool containsObject:title] && ![title isEqualToString:kFavoritesTitle]) [pool addObject:title];
+        if (title.length) [titles addObject:title];
     }
-    if (pool.count == 0) [pool addObjectsFromArray:@[@"Контакты", @"Звонки", @"Чаты", @"Настройки"]];
-    NSMutableArray *titles = [NSMutableArray array];
-    for (NSString *title in savedOrder()) {
-        if ([pool containsObject:title] && ![hidden containsObject:title] && ![titles containsObject:title]) {
-            [titles addObject:title];
-        }
-    }
-    for (NSString *title in pool) {
-        if (![hidden containsObject:title] && ![titles containsObject:title]) [titles addObject:title];
-    }
-    NSMutableArray *catalog = [NSMutableArray array];
-    for (NSString *title in pool) {
-        if ([hidden containsObject:title]) [catalog addObject:title];
-    }
+    if (titles.count == 0 && savedOrder().count) titles = [savedOrder() mutableCopy];
     SMDockEditor *editor = [[SMDockEditor alloc] init];
     editor.titles = titles;
-    editor.catalog = catalog;
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:editor];
     nav.modalPresentationStyle = UIModalPresentationPageSheet;
     nav.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
@@ -972,22 +698,6 @@ static BOOL isDockView(UIView *view) {
     return isBottomBar(view);
 }
 
-static IMP orig_trait;
-
-static void swizzled_trait(id self, SEL _cmd, UITraitCollection *previous) {
-    ((void (*)(id, SEL, UITraitCollection *))orig_trait)(self, _cmd, previous);
-    if (![self isKindOfClass:[UIView class]]) return;
-    UIView *view = self;
-    if (!isDockView(view) && ![view isKindOfClass:[UIWindow class]]) return;
-    if (previous.userInterfaceStyle == view.traitCollection.userInterfaceStyle) return;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        styleAllBars();
-    });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        styleAllBars();
-    });
-}
-
 static void swizzled_layout(id self, SEL _cmd) {
     ((void (*)(id, SEL))orig_layout)(self, _cmd);
     if (g_inStyle || ![self isKindOfClass:[UIView class]] || !isDockView((UIView *)self)) return;
@@ -1005,6 +715,16 @@ static void swizzled_appear(id self, SEL _cmd, BOOL animated) {
     ((void (*)(id, SEL, BOOL))orig_appear)(self, _cmd, animated);
     if (SettingsClass && [self isKindOfClass:SettingsClass]) installSettingsEntry((UIViewController *)self);
     styleAllBars();
+}
+
+static void scheduleRestyle(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{ styleAllBars(); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        styleAllBars();
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        styleAllBars();
+    });
 }
 
 static void resolveAndHook(void) {
@@ -1027,52 +747,19 @@ static void resolveAndHook(void) {
     orig_appear = method_getImplementation(appear);
     method_setImplementation(appear, (IMP)swizzled_appear);
 
-    Method trait = class_getInstanceMethod([UIView class], @selector(traitCollectionDidChange:));
-    orig_trait = method_getImplementation(trait);
-    method_setImplementation(trait, (IMP)swizzled_trait);
-}
-
-static IMP orig_infoDictionary;
-static IMP orig_infoKey;
-
-static BOOL g_inInfo;
-
-static NSDictionary *swizzled_infoDictionary(id self, SEL _cmd) {
-    NSDictionary *dict = ((NSDictionary *(*)(id, SEL))orig_infoDictionary)(self, _cmd);
-    if (g_inInfo || self != [NSBundle mainBundle] || ![dict isKindOfClass:[NSDictionary class]]) return dict;
-    g_inInfo = YES;
-    BOOL glass = liquidGlass();
-    g_inInfo = NO;
-    NSMutableDictionary *copy = [dict mutableCopy];
-    copy[@"UIDesignRequiresCompatibility"] = glass ? @NO : @YES;
-    return copy;
-}
-
-static id swizzled_infoKey(id self, SEL _cmd, NSString *key) {
-    if (!g_inInfo && self == [NSBundle mainBundle] && [key isEqualToString:@"UIDesignRequiresCompatibility"]) {
-        g_inInfo = YES;
-        BOOL glass = liquidGlass();
-        g_inInfo = NO;
-        return glass ? @NO : @YES;
-    }
-    return ((id (*)(id, SEL, NSString *))orig_infoKey)(self, _cmd, key);
-}
-
-static void hookLiquidGlassFlag(void) {
-    static BOOL hooked;
-    if (hooked) return;
-    hooked = YES;
-    Method info = class_getInstanceMethod([NSBundle class], @selector(infoDictionary));
-    orig_infoDictionary = method_getImplementation(info);
-    method_setImplementation(info, (IMP)swizzled_infoDictionary);
-    Method key = class_getInstanceMethod([NSBundle class], @selector(objectForInfoDictionaryKey:));
-    orig_infoKey = method_getImplementation(key);
-    method_setImplementation(key, (IMP)swizzled_infoKey);
+    NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
+    static id activeObserver;
+    static id foregroundObserver;
+    activeObserver = [center addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
+        scheduleRestyle();
+    }];
+    foregroundObserver = [center addObserverForName:UIApplicationWillEnterForegroundNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
+        scheduleRestyle();
+    }];
 }
 
 __attribute__((constructor))
 static void safeMAXDockInit(void) {
-    hookLiquidGlassFlag();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         resolveAndHook();
     });
