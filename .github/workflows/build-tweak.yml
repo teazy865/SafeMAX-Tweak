@@ -37,30 +37,53 @@ jobs:
           unzip -q SafeMAX.ipa -d extracted
           APP=$(find extracted/Payload -name "*.app" | head -1)
           echo "APP=$APP" >> $GITHUB_ENV
+          # Detect main binary
+          BINARY=$(basename "$APP" .app)
+          if [ -f "$APP/$BINARY" ]; then
+            echo "BINARY=$BINARY" >> $GITHUB_ENV
+          else
+            # Fallback: first executable
+            BINARY=$(find "$APP" -maxdepth 1 -type f -perm +111 | head -1 | xargs basename)
+            echo "BINARY=$BINARY" >> $GITHUB_ENV
+          fi
+          echo "Detected binary: $BINARY"
 
       - name: Build tweak dylib
         run: |
-          clang -dynamiclib -framework UIKit -framework Foundation -framework CoreGraphics \
-            -arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+          clang -dynamiclib \
+            -framework UIKit \
+            -framework Foundation \
+            -framework CoreGraphics \
+            -framework QuartzCore \
+            -fobjc-arc \
+            -arch arm64 \
+            -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
             -miphoneos-version-min=15.0 \
-            -o SafeMAXBarTweak.dylib tweak/SafeMAXBarTweak.m
+            -o SafeMAXBarTweak.dylib \
+            tweak/SafeMAXBarTweak.m
           ldid -S SafeMAXBarTweak.dylib
+          echo "Dylib built successfully"
+          ls -lh SafeMAXBarTweak.dylib
 
       - name: Inject dylib
         run: |
           cp SafeMAXBarTweak.dylib "$APP/"
-          insert_dylib @executable_path/SafeMAXBarTweak.dylib "$APP/MAX" --inplace --all-yes || \
-          insert_dylib @executable_path/SafeMAXBarTweak.dylib "$APP/MAX" --inplace
+          echo "Injecting into $APP/$BINARY"
+          insert_dylib @executable_path/SafeMAXBarTweak.dylib "$APP/$BINARY" --inplace --all-yes || \
+          insert_dylib @executable_path/SafeMAXBarTweak.dylib "$APP/$BINARY" --inplace
+          echo "Injection done"
 
       - name: Resign app
         run: |
-          ldid -S "$APP/MAX"
-          find "$APP" -name "*.dylib" -exec ldid -S {} \;
+          ldid -S "$APP/$BINARY" || true
+          find "$APP" -name "*.dylib" -exec ldid -S {} \; || true
           find "$APP/PlugIns" -name "*.appex" -exec sh -c 'ldid -S "$1/$(basename "$1" .appex)"' _ {} \; 2>/dev/null || true
+          echo "Resign done"
 
       - name: Package IPA
         run: |
           cd extracted && zip -qr ../SafeMAX-tweaked.ipa Payload
+          ls -lh ../SafeMAX-tweaked.ipa
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
