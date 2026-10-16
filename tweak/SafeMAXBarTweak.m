@@ -1002,8 +1002,6 @@ static void hookKeepDeleted(void) {
 }
 
 static Ivar sm_textIvar(id text, NSString **value) {
-
-static Ivar sm_textIvar(id text, NSString **value) {
     if (!text || [text isKindOfClass:[NSString class]]) {
         if (value && [text isKindOfClass:[NSString class]]) *value = text;
         return NULL;
