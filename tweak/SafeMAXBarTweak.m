@@ -1,6 +1,7 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <string.h>
 #import <QuartzCore/QuartzCore.h>
 
 // SafeMAX bottom dock is OMUIKit.TabBar, not UITabBar.
@@ -11,6 +12,8 @@ static NSString *const kFloatingKey = @"SafeMAX_FloatingDock";
 static NSString *const kOrderKey = @"SafeMAX_TabOrder";
 static NSString *const kGhostKey = @"SafeMAX_GhostMode";
 static NSString *const kAntiReadKey = @"SafeMAX_AntiRead";
+static NSString *const kKeepDeletedKey = @"SafeMAX_KeepDeleted";
+static NSString *const kKeepEditsKey = @"SafeMAX_KeepEdits";
 
 static const NSInteger kEntryTag = 0x5AF1;
 static const NSInteger kPillTag = 0x5AF3;
@@ -41,6 +44,16 @@ static BOOL ghostMode(void) {
 
 static BOOL antiRead(void) {
     id obj = [[NSUserDefaults standardUserDefaults] objectForKey:kAntiReadKey];
+    return obj ? [obj boolValue] : NO;
+}
+
+static BOOL keepDeleted(void) {
+    id obj = [[NSUserDefaults standardUserDefaults] objectForKey:kKeepDeletedKey];
+    return obj ? [obj boolValue] : NO;
+}
+
+static BOOL keepEdits(void) {
+    id obj = [[NSUserDefaults standardUserDefaults] objectForKey:kKeepEditsKey];
     return obj ? [obj boolValue] : NO;
 }
 
@@ -670,13 +683,19 @@ static void presentEditor(UIViewController *from) {
 
 - (void)switchChanged:(UISwitch *)sender {
     NSNumber *row = objc_getAssociatedObject(sender, "sm_row");
-    NSString *key = row.integerValue == 0 ? kGhostKey : kAntiReadKey;
+    NSString *key = kGhostKey;
+    switch (row.integerValue) {
+        case 1: key = kAntiReadKey; break;
+        case 2: key = kKeepDeletedKey; break;
+        case 3: key = kKeepEditsKey; break;
+        default: break;
+    }
     [[NSUserDefaults standardUserDefaults] setBool:sender.on forKey:key];
 }
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 1; }
 
-- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section { return 2; }
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section { return 4; }
 
 - (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath { return 60; }
 
@@ -687,17 +706,33 @@ static void presentEditor(UIViewController *from) {
     cell.textLabel.textColor = [UIColor whiteColor];
     cell.detailTextLabel.textColor = [UIColor colorWithWhite:1 alpha:0.55];
     cell.selectionStyle = UITableViewCellSelectionStyleNone;
-    if (indexPath.row == 0) {
-        cell.textLabel.text = @"Скрыть онлайн";
-        cell.detailTextLabel.text = @"Вас не видно в сети";
-    } else {
-        cell.textLabel.text = @"Нечиталка";
-        cell.detailTextLabel.text = @"Сообщения не отмечаются прочитанными";
+    BOOL on = NO;
+    switch (indexPath.row) {
+        case 0:
+            cell.textLabel.text = @"Скрыть онлайн";
+            cell.detailTextLabel.text = @"Вас не видно в сети";
+            on = ghostMode();
+            break;
+        case 1:
+            cell.textLabel.text = @"Нечиталка";
+            cell.detailTextLabel.text = @"Сообщения не отмечаются прочитанными";
+            on = antiRead();
+            break;
+        case 2:
+            cell.textLabel.text = @"Удалённые сообщения";
+            cell.detailTextLabel.text = @"Текст остаётся, даже если его удалили";
+            on = keepDeleted();
+            break;
+        default:
+            cell.textLabel.text = @"История правок";
+            cell.detailTextLabel.text = @"Старый текст остаётся под новым";
+            on = keepEdits();
+            break;
     }
     UISwitch *toggle = [[UISwitch alloc] init];
     objc_setAssociatedObject(toggle, "sm_row", @(indexPath.row), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     [toggle addTarget:self action:@selector(switchChanged:) forControlEvents:UIControlEventValueChanged];
-    toggle.on = indexPath.row == 0 ? ghostMode() : antiRead();
+    toggle.on = on;
     cell.accessoryView = toggle;
     return cell;
 }
@@ -857,6 +892,108 @@ static void hookAntiRead(void) {
     free(classes);
 }
 
+static IMP orig_deleteLocal;
+
+static id swizzled_deleteLocal(id self, SEL _cmd, id messageIds, id chat) {
+    if (keepDeleted()) return nil;
+    return ((id (*)(id, SEL, id, id))orig_deleteLocal)(self, _cmd, messageIds, chat);
+}
+
+static void hookKeepDeleted(void) {
+    static BOOL hooked;
+    if (hooked) return;
+    SEL sel = @selector(deleteLocallyMessagesWithIds:updateChat:);
+    unsigned int count = 0;
+    Class *classes = objc_copyClassList(&count);
+    if (!classes) return;
+    for (unsigned int i = 0; i < count && !hooked; i++) {
+        unsigned int methodCount = 0;
+        Method *methods = class_copyMethodList(classes[i], &methodCount);
+        for (unsigned int j = 0; j < methodCount; j++) {
+            if (method_getName(methods[j]) != sel) continue;
+            orig_deleteLocal = method_getImplementation(methods[j]);
+            method_setImplementation(methods[j], (IMP)swizzled_deleteLocal);
+            hooked = YES;
+            break;
+        }
+        free(methods);
+    }
+    free(classes);
+}
+
+static Ivar sm_textIvar(id text, NSString **value) {
+    if (!text || [text isKindOfClass:[NSString class]]) {
+        if (value && [text isKindOfClass:[NSString class]]) *value = text;
+        return NULL;
+    }
+    Class cls = object_getClass(text);
+    Ivar fallback = NULL;
+    NSString *fallbackValue = nil;
+    while (cls) {
+        unsigned int count = 0;
+        Ivar *ivars = class_copyIvarList(cls, &count);
+        for (unsigned int i = 0; i < count; i++) {
+            const char *enc = ivar_getTypeEncoding(ivars[i]);
+            const char *name = ivar_getName(ivars[i]);
+            if (!enc || strcmp(enc, "@\"NSString\"") != 0) continue;
+            id current = object_getIvar(text, ivars[i]);
+            if (![current isKindOfClass:[NSString class]] || ![current length]) continue;
+            BOOL named = name && (strstr(name, "text") || strstr(name, "Text") || strstr(name, "string") || strstr(name, "String"));
+            if (named) {
+                if (value) *value = current;
+                Ivar found = ivars[i];
+                free(ivars);
+                return found;
+            }
+            if (!fallback) {
+                fallback = ivars[i];
+                fallbackValue = current;
+            }
+        }
+        free(ivars);
+        cls = class_getSuperclass(cls);
+    }
+    if (fallback && value) *value = fallbackValue;
+    return fallback;
+}
+
+static IMP orig_setMessageText;
+
+static void swizzled_setMessageText(id self, SEL _cmd, id newText) {
+    if (keepEdits() && newText && [self respondsToSelector:@selector(messageText)]) {
+        id oldText = ((id (*)(id, SEL))objc_msgSend)(self, @selector(messageText));
+        NSString *oldString = nil;
+        NSString *newString = nil;
+        sm_textIvar(oldText, &oldString);
+        Ivar ivar = sm_textIvar(newText, &newString);
+        if (oldString.length && newString.length && ![oldString isEqualToString:newString] && [newString rangeOfString:@"—— было ——"].location == NSNotFound) {
+            NSString *combined = [NSString stringWithFormat:@"%@\n—— было ——\n%@", newString, oldString];
+            if (ivar) object_setIvar(newText, ivar, combined);
+        }
+    }
+    ((void (*)(id, SEL, id))orig_setMessageText)(self, _cmd, newText);
+}
+
+static void hookKeepEdits(void) {
+    static BOOL hooked;
+    if (hooked) return;
+    Class cls = objc_getClass("OKMMessage");
+    SEL sel = @selector(setMessageText:);
+    while (cls && !hooked) {
+        unsigned int methodCount = 0;
+        Method *methods = class_copyMethodList(cls, &methodCount);
+        for (unsigned int i = 0; i < methodCount; i++) {
+            if (method_getName(methods[i]) != sel) continue;
+            orig_setMessageText = method_getImplementation(methods[i]);
+            method_setImplementation(methods[i], (IMP)swizzled_setMessageText);
+            hooked = YES;
+            break;
+        }
+        free(methods);
+        cls = class_getSuperclass(cls);
+    }
+}
+
 static void hookGhost(void) {
     static BOOL hooked;
     if (hooked) return;
@@ -880,6 +1017,8 @@ static void resolveAndHook(void) {
     styleAllBars();
     hookGhost();
     hookAntiRead();
+    hookKeepDeleted();
+    hookKeepEdits();
     if (hooked) return;
     hooked = YES;
 
@@ -913,6 +1052,8 @@ static void safeMAXDockInit(void) {
     hookLiquidGlassFlag();
     hookGhost();
     hookAntiRead();
+    hookKeepDeleted();
+    hookKeepEdits();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         resolveAndHook();
     });
