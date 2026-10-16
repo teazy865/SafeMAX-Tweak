@@ -223,7 +223,7 @@ static BOOL isBackdrop(UIView *sub, UIView *bar) {
         [name containsString:@"Backdrop"] || [name containsString:@"Shadow"]) {
         return YES;
     }
-    BOOL hasContent = NO;
+    __block BOOL hasContent = NO;
     eachLabel(sub, ^(UILabel *label) { hasContent = YES; });
     if (hasContent) return NO;
     if ([sub isKindOfClass:[UIImageView class]] && ((UIImageView *)sub).image) return NO;
