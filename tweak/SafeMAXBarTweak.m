@@ -901,67 +901,72 @@ static id swizzled_deleteLocal(id self, SEL _cmd, id messageIds, id chat) {
 
 static IMP orig_setStatus;
 static IMP orig_status;
+static IMP orig_messagesDeleted;
+static Class smMessageClass;
 
 static void swizzled_setStatus(id self, SEL _cmd, NSInteger status) {
-    if (keepDeleted() && status == 2) return;
+    if (keepDeleted() && status == 2 && smMessageClass && [self isKindOfClass:smMessageClass]) return;
     ((void (*)(id, SEL, NSInteger))orig_setStatus)(self, _cmd, status);
 }
 
 static NSInteger swizzled_status(id self, SEL _cmd) {
     NSInteger status = ((NSInteger (*)(id, SEL))orig_status)(self, _cmd);
-    if (keepDeleted() && status == 2) return 0;
+    if (keepDeleted() && status == 2 && smMessageClass && [self isKindOfClass:smMessageClass]) return 0;
     return status;
+}
+
+static void swizzled_messagesDeleted(id self, SEL _cmd, id messages, id chat) {
+    if (keepDeleted()) return;
+    ((void (*)(id, SEL, id, id))orig_messagesDeleted)(self, _cmd, messages, chat);
 }
 
 static void hookKeepDeleted(void) {
     static BOOL hookedDelete;
     static BOOL hookedStatus;
     static BOOL hookedGetter;
-    if (hookedDelete && hookedStatus && hookedGetter) return;
+    static BOOL hookedMessagesDeleted;
+    if (hookedDelete && hookedStatus && hookedGetter && hookedMessagesDeleted) return;
+    if (!smMessageClass) smMessageClass = objc_getClass("OKMMessage");
     SEL deleteSel = @selector(deleteLocallyMessagesWithIds:updateChat:);
     SEL statusSel = @selector(setStatus:);
     SEL getterSel = @selector(status);
+    SEL deletedSel = @selector(_messagesDeleted:inChat:);
+    if (smMessageClass && !hookedStatus) {
+        Method method = class_getInstanceMethod(smMessageClass, statusSel);
+        if (method) {
+            orig_setStatus = method_getImplementation(method);
+            method_setImplementation(method, (IMP)swizzled_setStatus);
+            hookedStatus = YES;
+        }
+    }
+    if (smMessageClass && !hookedGetter) {
+        Method method = class_getInstanceMethod(smMessageClass, getterSel);
+        if (method) {
+            orig_status = method_getImplementation(method);
+            method_setImplementation(method, (IMP)swizzled_status);
+            hookedGetter = YES;
+        }
+    }
     unsigned int count = 0;
     Class *classes = objc_copyClassList(&count);
     if (!classes) return;
-    for (unsigned int i = 0; i < count && !(hookedDelete && hookedStatus && hookedGetter); i++) {
-        const char *name = class_getName(classes[i]);
-        if (!hookedDelete) {
-            unsigned int methodCount = 0;
-            Method *methods = class_copyMethodList(classes[i], &methodCount);
-            for (unsigned int j = 0; j < methodCount; j++) {
-                if (method_getName(methods[j]) != deleteSel) continue;
+    for (unsigned int i = 0; i < count && !(hookedDelete && hookedMessagesDeleted); i++) {
+        unsigned int methodCount = 0;
+        Method *methods = class_copyMethodList(classes[i], &methodCount);
+        for (unsigned int j = 0; j < methodCount; j++) {
+            SEL sel = method_getName(methods[j]);
+            if (!hookedDelete && sel == deleteSel) {
                 orig_deleteLocal = method_getImplementation(methods[j]);
                 method_setImplementation(methods[j], (IMP)swizzled_deleteLocal);
                 hookedDelete = YES;
-                break;
             }
-            free(methods);
-        }
-        if (name && strcmp(name, "OKMMessage") == 0) {
-            Class cls = classes[i];
-            while (cls && !(hookedStatus && hookedGetter)) {
-                const char *clsName = class_getName(cls);
-                if (!clsName || !strstr(clsName, "Message")) break;
-                unsigned int methodCount = 0;
-                Method *methods = class_copyMethodList(cls, &methodCount);
-                for (unsigned int j = 0; j < methodCount; j++) {
-                    SEL sel = method_getName(methods[j]);
-                    if (!hookedStatus && sel == statusSel) {
-                        orig_setStatus = method_getImplementation(methods[j]);
-                        method_setImplementation(methods[j], (IMP)swizzled_setStatus);
-                        hookedStatus = YES;
-                    }
-                    if (!hookedGetter && sel == getterSel) {
-                        orig_status = method_getImplementation(methods[j]);
-                        method_setImplementation(methods[j], (IMP)swizzled_status);
-                        hookedGetter = YES;
-                    }
-                }
-                free(methods);
-                cls = class_getSuperclass(cls);
+            if (!hookedMessagesDeleted && sel == deletedSel) {
+                orig_messagesDeleted = method_getImplementation(methods[j]);
+                method_setImplementation(methods[j], (IMP)swizzled_messagesDeleted);
+                hookedMessagesDeleted = YES;
             }
         }
+        free(methods);
     }
     free(classes);
 }
