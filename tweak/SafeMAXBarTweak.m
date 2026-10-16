@@ -9,11 +9,9 @@ static NSString *const kFloatingKey = @"SafeMAX_FloatingDock";
 static NSString *const kOrderKey = @"SafeMAX_TabOrder";
 
 static const NSInteger kEntryTag = 0x5AF1;
-static const NSInteger kHeaderWrapTag = 0x5AF2;
 
 static Class TabBarClass;
 static Class SettingsClass;
-static Class HeaderClass;
 static IMP orig_layout;
 static IMP orig_vc_layout;
 static IMP orig_appear;
@@ -443,79 +441,46 @@ static void presentEditor(UIViewController *from) {
     [from presentViewController:nav animated:YES completion:nil];
 }
 
-static UILabel *findPhoneLabel(UIView *root) {
-    __block UILabel *found = nil;
-    eachLabel(root, ^(UILabel *label) {
-        if (found) return;
-        NSString *text = label.text;
-        if (text.length < 6) return;
-        NSCharacterSet *digits = [NSCharacterSet decimalDigitCharacterSet];
-        NSUInteger digitCount = 0;
-        for (NSUInteger i = 0; i < text.length; i++) {
-            if ([digits characterIsMember:[text characterAtIndex:i]]) digitCount++;
-        }
-        if (digitCount >= 8 && [text containsString:@"+"]) found = label;
-    });
-    return found;
-}
-
 static void installSettingsEntry(UIViewController *vc) {
     if (g_inSettings || (SettingsClass && ![vc isKindOfClass:SettingsClass])) return;
     g_inSettings = YES;
 
     UITableView *table = findTable(vc.view);
-    if (table.tableHeaderView.tag == kHeaderWrapTag) {
-        UIView *wrap = table.tableHeaderView;
-        UIView *original = nil;
-        for (UIView *sub in wrap.subviews) {
-            if (sub.tag != kEntryTag) { original = sub; break; }
-        }
-        if (original) {
-            CGRect frame = original.frame;
-            frame.origin = CGPointZero;
-            frame.size.width = table.bounds.size.width;
-            original.frame = frame;
-            table.tableHeaderView = original;
-        }
+    if (!table || table.bounds.size.width < 20) {
+        g_inSettings = NO;
+        return;
     }
 
-    UIView *header = HeaderClass ? findKind(vc.view, HeaderClass) : nil;
-    if (!header) header = table.tableHeaderView;
-    UILabel *phone = findPhoneLabel(header ?: vc.view);
-    UIView *host = phone.superview ?: header;
+    // Drop the row if a previous layout stuck it over the profile cards.
+    UIView *stray = [vc.view viewWithTag:kEntryTag];
+    if (stray && stray != table.tableFooterView && ![stray isDescendantOfView:table.tableFooterView]) {
+        [stray removeFromSuperview];
+    }
 
-    if (host && host.bounds.size.width > 40) {
-        SMDockEntry *entry = (SMDockEntry *)[host viewWithTag:kEntryTag];
-        if (!entry) {
-            entry = [[SMDockEntry alloc] initWithFrame:CGRectZero];
-            entry.tag = kEntryTag;
-            entry.owner = vc;
-            [host addSubview:entry];
-        }
-        CGFloat width = host.bounds.size.width;
-        CGFloat y = phone ? CGRectGetMaxY([phone convertRect:phone.bounds toView:host]) + 16 : host.bounds.size.height;
-        if (y > 20) {
-            entry.frame = CGRectMake(16, y, width - 32, 62);
-            if (!objc_getAssociatedObject(host, "sm_grown")) {
-                CGRect frame = host.frame;
-                frame.size.height += 78;
-                host.frame = frame;
-                objc_setAssociatedObject(host, "sm_grown", @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                if (table && (table.tableHeaderView == host || [host isDescendantOfView:table.tableHeaderView])) {
-                    UIView *hv = table.tableHeaderView;
-                    CGRect headerFrame = hv.frame;
-                    headerFrame.size.height += 78;
-                    hv.frame = headerFrame;
-                    table.tableHeaderView = hv;
-                }
-            }
-        }
-    } else if (table && table.tableFooterView.tag != kEntryTag) {
-        SMDockEntry *entry = [[SMDockEntry alloc] initWithFrame:CGRectMake(16, 12, table.bounds.size.width - 32, 62)];
-        entry.tag = kEntryTag;
-        entry.owner = vc;
-        UIView *wrap = [[UIView alloc] initWithFrame:CGRectMake(0, 0, table.bounds.size.width, 90)];
+    if (!objc_getAssociatedObject(table, "sm_inset")) {
+        UIEdgeInsets inset = table.contentInset;
+        inset.bottom += 88;
+        table.contentInset = inset;
+        table.verticalScrollIndicatorInsets = inset;
+        objc_setAssociatedObject(table, "sm_inset", @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+
+    if (table.tableFooterView.tag != kEntryTag) {
+        CGFloat width = table.bounds.size.width;
+        UIView *existing = table.tableFooterView;
+        CGFloat existingH = existing ? existing.bounds.size.height : 0;
+        UIView *wrap = [[UIView alloc] initWithFrame:CGRectMake(0, 0, width, existingH + 108)];
         wrap.tag = kEntryTag;
+        wrap.backgroundColor = [UIColor clearColor];
+        if (existing) {
+            existing.tag = 0;
+            existing.frame = CGRectMake(0, 0, width, existingH);
+            existing.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+            [wrap addSubview:existing];
+        }
+        SMDockEntry *entry = [[SMDockEntry alloc] initWithFrame:CGRectMake(16, existingH + 16, width - 32, 62)];
+        entry.owner = vc;
+        entry.autoresizingMask = UIViewAutoresizingFlexibleWidth;
         [wrap addSubview:entry];
         table.tableFooterView = wrap;
     }
@@ -551,7 +516,6 @@ static void resolveAndHook(void) {
     static BOOL hooked;
     TabBarClass = objc_getClass("_TtC7OMUIKit6TabBar");
     SettingsClass = objc_getClass("_TtC10SettingsUI22SettingsViewController");
-    HeaderClass = objc_getClass("_TtC10SettingsUI18SettingsHeaderView");
     styleAllBars();
     if (hooked) return;
     hooked = YES;
