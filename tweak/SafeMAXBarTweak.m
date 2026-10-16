@@ -10,6 +10,7 @@ static NSString *const kShowLabelsKey = @"SafeMAX_ShowLabels";
 static NSString *const kFloatingKey = @"SafeMAX_FloatingDock";
 static NSString *const kOrderKey = @"SafeMAX_TabOrder";
 static NSString *const kGhostKey = @"SafeMAX_GhostMode";
+static NSString *const kAntiReadKey = @"SafeMAX_AntiRead";
 
 static const NSInteger kEntryTag = 0x5AF1;
 static const NSInteger kPillTag = 0x5AF3;
@@ -35,6 +36,11 @@ static BOOL floatingDock(void) {
 
 static BOOL ghostMode(void) {
     id obj = [[NSUserDefaults standardUserDefaults] objectForKey:kGhostKey];
+    return obj ? [obj boolValue] : NO;
+}
+
+static BOOL antiRead(void) {
+    id obj = [[NSUserDefaults standardUserDefaults] objectForKey:kAntiReadKey];
     return obj ? [obj boolValue] : NO;
 }
 
@@ -663,37 +669,36 @@ static void presentEditor(UIViewController *from) {
 }
 
 - (void)switchChanged:(UISwitch *)sender {
-    [[NSUserDefaults standardUserDefaults] setBool:sender.on forKey:kGhostKey];
+    NSNumber *row = objc_getAssociatedObject(sender, "sm_row");
+    NSString *key = row.integerValue == 0 ? kGhostKey : kAntiReadKey;
+    [[NSUserDefaults standardUserDefaults] setBool:sender.on forKey:key];
 }
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 1; }
 
-- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section { return 1; }
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section { return 2; }
 
-- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
-    return @"Приложение остаётся на связи, но другим вы не показываетесь в сети. Статус обновится после следующего пинга.";
-}
+- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath { return 60; }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"g"];
-    if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"g"];
+    if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"g"];
     cell.backgroundColor = [UIColor colorWithWhite:0.14 alpha:1];
     cell.textLabel.textColor = [UIColor whiteColor];
-    cell.textLabel.text = @"Скрыть онлайн";
+    cell.detailTextLabel.textColor = [UIColor colorWithWhite:1 alpha:0.55];
     cell.selectionStyle = UITableViewCellSelectionStyleNone;
-    UISwitch *toggle = [cell.contentView viewWithTag:9];
-    if (!toggle) {
-        toggle = [[UISwitch alloc] init];
-        toggle.tag = 9;
-        toggle.translatesAutoresizingMaskIntoConstraints = NO;
-        [toggle addTarget:self action:@selector(switchChanged:) forControlEvents:UIControlEventValueChanged];
-        [cell.contentView addSubview:toggle];
-        [NSLayoutConstraint activateConstraints:@[
-            [toggle.centerYAnchor constraintEqualToAnchor:cell.contentView.centerYAnchor],
-            [toggle.trailingAnchor constraintEqualToAnchor:cell.contentView.trailingAnchor constant:-8]
-        ]];
+    if (indexPath.row == 0) {
+        cell.textLabel.text = @"Скрыть онлайн";
+        cell.detailTextLabel.text = @"Вас не видно в сети";
+    } else {
+        cell.textLabel.text = @"Нечиталка";
+        cell.detailTextLabel.text = @"Сообщения не отмечаются прочитанными";
     }
-    toggle.on = ghostMode();
+    UISwitch *toggle = [[UISwitch alloc] init];
+    objc_setAssociatedObject(toggle, "sm_row", @(indexPath.row), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [toggle addTarget:self action:@selector(switchChanged:) forControlEvents:UIControlEventValueChanged];
+    toggle.on = indexPath.row == 0 ? ghostMode() : antiRead();
+    cell.accessoryView = toggle;
     return cell;
 }
 
@@ -823,6 +828,35 @@ static BOOL swizzled_interactive(id self, SEL _cmd) {
     return ((BOOL (*)(id, SEL))orig_interactive)(self, _cmd);
 }
 
+static IMP orig_markChat;
+
+static void *swizzled_markChat(id self, SEL _cmd, id chat, id readTo, id messageId) {
+    if (antiRead()) return NULL;
+    return ((void *(*)(id, SEL, id, id, id))orig_markChat)(self, _cmd, chat, readTo, messageId);
+}
+
+static void hookAntiRead(void) {
+    static BOOL hooked;
+    if (hooked) return;
+    SEL sel = @selector(markChat:asReadTo:messageId:);
+    unsigned int count = 0;
+    Class *classes = objc_copyClassList(&count);
+    if (!classes) return;
+    for (unsigned int i = 0; i < count && !hooked; i++) {
+        unsigned int methodCount = 0;
+        Method *methods = class_copyMethodList(classes[i], &methodCount);
+        for (unsigned int j = 0; j < methodCount; j++) {
+            if (method_getName(methods[j]) != sel) continue;
+            orig_markChat = method_getImplementation(methods[j]);
+            method_setImplementation(methods[j], (IMP)swizzled_markChat);
+            hooked = YES;
+            break;
+        }
+        free(methods);
+    }
+    free(classes);
+}
+
 static void hookGhost(void) {
     static BOOL hooked;
     if (hooked) return;
@@ -845,6 +879,7 @@ static void resolveAndHook(void) {
     SettingsClass = objc_getClass("_TtC10SettingsUI22SettingsViewController");
     styleAllBars();
     hookGhost();
+    hookAntiRead();
     if (hooked) return;
     hooked = YES;
 
@@ -877,6 +912,7 @@ __attribute__((constructor))
 static void safeMAXDockInit(void) {
     hookLiquidGlassFlag();
     hookGhost();
+    hookAntiRead();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         resolveAndHook();
     });
