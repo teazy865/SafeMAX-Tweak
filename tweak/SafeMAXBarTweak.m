@@ -731,7 +731,7 @@ static void presentEditor(UIViewController *from) {
             break;
         case 2:
             cell.textLabel.text = @"Удалённые сообщения";
-            cell.detailTextLabel.text = @"Текст остаётся, даже если его удалили";
+            cell.detailTextLabel.text = @"Текст остаётся, тускнеет и помечается ❌";
             on = keepDeleted();
             break;
         default:
@@ -838,8 +838,11 @@ static BOOL isDockView(UIView *view) {
     return isBottomBar(view);
 }
 
+static void sm_updateDeletedCell(UIView *cell);
+
 static void swizzled_layout(id self, SEL _cmd) {
     ((void (*)(id, SEL))orig_layout)(self, _cmd);
+    if ([self isKindOfClass:[UIView class]]) sm_updateDeletedCell((UIView *)self);
     if (g_inStyle || ![self isKindOfClass:[UIView class]] || !isDockView((UIView *)self)) return;
     g_inStyle = YES;
     styleTabBar((UIView *)self);
@@ -941,13 +944,26 @@ static BOOL sm_isRemovalEvent(id value) {
     return type == 3;
 }
 
+static void sm_noteDeletedPayload(id ids, id chat, id serviceOwner);
+static void sm_rememberDeletedText(NSString *text);
+static NSString *sm_messageBody(id message);
+static void sm_refreshDeletedLooks(void);
+static void sm_updateDeletedCell(UIView *cell);
+
 static id swizzled_deleteLocal(id self, SEL _cmd, id messageIds, id chat) {
-    if (keepDeleted()) return nil;
+    if (keepDeleted()) {
+        sm_noteDeletedPayload(messageIds, chat, self);
+        return nil;
+    }
     return ((id (*)(id, SEL, id, id))orig_deleteLocal)(self, _cmd, messageIds, chat);
 }
 
 static void swizzled_setStatus(id self, SEL _cmd, NSUInteger status) {
-    if (keepDeleted() && status == 2 && smMessageClass && [self isKindOfClass:smMessageClass]) return;
+    if (keepDeleted() && status == 2 && smMessageClass && [self isKindOfClass:smMessageClass]) {
+        sm_rememberDeletedText(sm_messageBody(self));
+        sm_refreshDeletedLooks();
+        return;
+    }
     ((void (*)(id, SEL, NSUInteger))orig_setStatus)(self, _cmd, status);
 }
 
@@ -958,12 +974,20 @@ static NSUInteger swizzled_status(id self, SEL _cmd) {
 }
 
 static void swizzled_messagesDeleted(id self, SEL _cmd, id messages, id chat) {
-    if (keepDeleted()) return;
+    if (keepDeleted()) {
+        sm_noteDeletedPayload(messages, chat, self);
+        return;
+    }
     ((void (*)(id, SEL, id, id))orig_messagesDeleted)(self, _cmd, messages, chat);
 }
 
 static void swizzled_delayedDeleted(id self, SEL _cmd, id notification) {
-    if (keepDeleted()) return;
+    if (keepDeleted()) {
+        id ids = [notification respondsToSelector:@selector(messageIds)] ? ((id (*)(id, SEL))objc_msgSend)(notification, @selector(messageIds)) : notification;
+        id chat = [notification respondsToSelector:@selector(chat)] ? ((id (*)(id, SEL))objc_msgSend)(notification, @selector(chat)) : nil;
+        sm_noteDeletedPayload(ids, chat, self);
+        return;
+    }
     ((void (*)(id, SEL, id))orig_delayedDeleted)(self, _cmd, notification);
 }
 
@@ -1035,6 +1059,205 @@ static Ivar sm_textIvar(id text, NSString **value) {
     }
     if (fallback && value) *value = fallbackValue;
     return fallback;
+}
+
+static const NSInteger kDeletedBadgeTag = 0x5AFD;
+static NSMutableOrderedSet<NSString *> *smDeletedBodies;
+static NSLock *smDeletedLock;
+
+static void sm_loadDeletedBodies(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        smDeletedLock = [[NSLock alloc] init];
+        NSArray *saved = [[NSUserDefaults standardUserDefaults] arrayForKey:@"SafeMAX_DeletedBodies"];
+        smDeletedBodies = saved ? [NSMutableOrderedSet orderedSetWithArray:saved] : [NSMutableOrderedSet orderedSet];
+    });
+}
+
+static BOOL sm_isDeletedBody(NSString *text) {
+    if (text.length == 0) return NO;
+    NSString *trimmed = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (trimmed.length == 0) return NO;
+    sm_loadDeletedBodies();
+    [smDeletedLock lock];
+    BOOL hit = [smDeletedBodies containsObject:trimmed];
+    [smDeletedLock unlock];
+    return hit;
+}
+
+static void sm_rememberDeletedText(NSString *text) {
+    if (text.length == 0) return;
+    sm_loadDeletedBodies();
+    NSArray<NSString *> *parts = [text componentsSeparatedByString:@"\n—— было ——\n"];
+    BOOL changed = NO;
+    [smDeletedLock lock];
+    for (NSString *part in parts) {
+        NSString *trimmed = [part stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (trimmed.length == 0 || [smDeletedBodies containsObject:trimmed]) continue;
+        [smDeletedBodies addObject:trimmed];
+        changed = YES;
+    }
+    while (smDeletedBodies.count > 400) [smDeletedBodies removeObjectAtIndex:0];
+    NSArray *snapshot = changed ? [smDeletedBodies array] : nil;
+    [smDeletedLock unlock];
+    if (snapshot) [[NSUserDefaults standardUserDefaults] setObject:snapshot forKey:@"SafeMAX_DeletedBodies"];
+}
+
+static NSString *sm_messageBody(id message) {
+    if (!message || [message isKindOfClass:[NSNumber class]]) return nil;
+    if ([message isKindOfClass:[NSString class]]) return message;
+    NSString *text = nil;
+    if ([message respondsToSelector:@selector(messageText)]) {
+        id messageText = ((id (*)(id, SEL))objc_msgSend)(message, @selector(messageText));
+        sm_textIvar(messageText, &text);
+        if (text.length) return text;
+        if ([messageText isKindOfClass:[NSString class]] && [messageText length]) return messageText;
+    }
+    if ([message respondsToSelector:@selector(shownMessageText)]) {
+        id shown = ((id (*)(id, SEL))objc_msgSend)(message, @selector(shownMessageText));
+        if ([shown isKindOfClass:[NSString class]] && [shown length]) return shown;
+    }
+    if ([message respondsToSelector:@selector(messageBody)]) {
+        id body = ((id (*)(id, SEL))objc_msgSend)(message, @selector(messageBody));
+        if ([body isKindOfClass:[NSString class]] && [body length]) return body;
+    }
+    return nil;
+}
+
+static void sm_noteDeletedPayload(id ids, id chat, id serviceOwner) {
+    NSMutableArray *items = [NSMutableArray array];
+    if ([ids isKindOfClass:[NSArray class]] || [ids isKindOfClass:[NSSet class]] || [ids isKindOfClass:[NSOrderedSet class]]) {
+        for (id item in ids) if (item) [items addObject:item];
+    } else if (ids) {
+        [items addObject:ids];
+    }
+    id service = serviceOwner;
+    if (service && ![service respondsToSelector:@selector(messageWithId:chatId:)] && [service respondsToSelector:@selector(chatService)]) {
+        service = ((id (*)(id, SEL))objc_msgSend)(service, @selector(chatService));
+    }
+    id chatId = [chat respondsToSelector:@selector(chatId)] ? ((id (*)(id, SEL))objc_msgSend)(chat, @selector(chatId)) : nil;
+    for (id item in items) {
+        NSString *body = sm_messageBody(item);
+        if (!body.length && service && chatId && [service respondsToSelector:@selector(messageWithId:chatId:)]) {
+            id message = nil;
+            @try {
+                message = ((id (*)(id, SEL, id, id))objc_msgSend)(service, @selector(messageWithId:chatId:), item, chatId);
+            } @catch (__unused NSException *exception) {
+                message = nil;
+            }
+            body = sm_messageBody(message);
+        }
+        if (body.length) sm_rememberDeletedText(body);
+    }
+    if (items.count) sm_refreshDeletedLooks();
+}
+
+static NSString *sm_viewText(UIView *view) {
+    if (view.tag == kDeletedBadgeTag) return nil;
+    if ([view isKindOfClass:[UILabel class]]) return ((UILabel *)view).text;
+    if ([view isKindOfClass:[UITextView class]]) return ((UITextView *)view).text;
+    if ([view respondsToSelector:@selector(attributedText)]) {
+        id attr = ((id (*)(id, SEL))objc_msgSend)(view, @selector(attributedText));
+        if ([attr isKindOfClass:[NSAttributedString class]]) {
+            NSString *string = ((NSAttributedString *)attr).string;
+            if (string.length) return string;
+        }
+    }
+    if ([view respondsToSelector:@selector(text)]) {
+        id text = ((id (*)(id, SEL))objc_msgSend)(view, @selector(text));
+        if ([text isKindOfClass:[NSString class]] && [text length]) return text;
+    }
+    return nil;
+}
+
+static BOOL sm_treeHasDeletedText(UIView *view) {
+    if (sm_isDeletedBody(sm_viewText(view))) return YES;
+    if (view.tag != kDeletedBadgeTag && sm_isDeletedBody(view.accessibilityLabel)) return YES;
+    for (UIView *subview in view.subviews) {
+        if (sm_treeHasDeletedText(subview)) return YES;
+    }
+    return NO;
+}
+
+static BOOL sm_isHistoryMessageCell(UIView *view) {
+    const char *name = class_getName(object_getClass(view));
+    return name && (strstr(name, "11MessageCell") || strstr(name, "WidgetMessageCell"));
+}
+
+static UIView *sm_messageBubble(UIView *cell) {
+    Class cls = object_getClass(cell);
+    Ivar ivar = NULL;
+    while (cls && !ivar) {
+        ivar = class_getInstanceVariable(cls, "bubbleView");
+        cls = class_getSuperclass(cls);
+    }
+    if (ivar) {
+        id value = object_getIvar(cell, ivar);
+        if ([value isKindOfClass:[UIView class]] && ((UIView *)value).bounds.size.width > 8) return value;
+    }
+    UIView *best = nil;
+    CGFloat bestArea = 0;
+    for (UIView *subview in cell.subviews) {
+        if (subview.tag == kDeletedBadgeTag || subview.hidden) continue;
+        CGFloat area = subview.bounds.size.width * subview.bounds.size.height;
+        if (area > bestArea) {
+            best = subview;
+            bestArea = area;
+        }
+    }
+    return best;
+}
+
+static void sm_updateDeletedCell(UIView *cell) {
+    if (!sm_isHistoryMessageCell(cell)) return;
+    static BOOL busy;
+    if (busy) return;
+    busy = YES;
+    BOOL deleted = keepDeleted() && sm_treeHasDeletedText(cell);
+    UIView *bubble = sm_messageBubble(cell);
+    UILabel *badge = (UILabel *)[cell viewWithTag:kDeletedBadgeTag];
+    if (!deleted) {
+        if (badge) [badge removeFromSuperview];
+        if (bubble && fabs(bubble.alpha - 1) > 0.01) bubble.alpha = 1;
+        busy = NO;
+        return;
+    }
+    if (bubble) bubble.alpha = 0.62;
+    if (![badge isKindOfClass:[UILabel class]]) {
+        badge = [[UILabel alloc] init];
+        badge.tag = kDeletedBadgeTag;
+        badge.text = @"❌";
+        badge.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
+        badge.userInteractionEnabled = NO;
+        badge.backgroundColor = [UIColor clearColor];
+        [cell addSubview:badge];
+    }
+    CGRect frame = bubble ? [bubble convertRect:bubble.bounds toView:cell] : CGRectInset(cell.bounds, 12, 8);
+    BOOL outgoing = CGRectGetMidX(frame) > CGRectGetMidX(cell.bounds);
+    CGFloat side = 18;
+    CGFloat x = outgoing ? CGRectGetMinX(frame) - side - 3 : CGRectGetMaxX(frame) + 3;
+    CGFloat y = CGRectGetMidY(frame) - side / 2.0;
+    if (x < 1) x = 1;
+    CGFloat maxX = cell.bounds.size.width - side - 1;
+    if (x > maxX) x = MAX(1, maxX);
+    if (y < 1) y = 1;
+    badge.frame = CGRectMake(x, y, side, side);
+    [cell bringSubviewToFront:badge];
+    busy = NO;
+}
+
+static void sm_markDeletedTree(UIView *view) {
+    if (sm_isHistoryMessageCell(view)) {
+        sm_updateDeletedCell(view);
+        return;
+    }
+    for (UIView *subview in view.subviews) sm_markDeletedTree(subview);
+}
+
+static void sm_refreshDeletedLooks(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        for (UIWindow *window in allWindows()) sm_markDeletedTree(window);
+    });
 }
 
 static IMP orig_setMessageText;
