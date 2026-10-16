@@ -40,7 +40,7 @@ jobs:
 
       - name: Build tweak dylib
         run: |
-          clang -dynamiclib -framework UIKit -framework Foundation \
+          clang -dynamiclib -framework UIKit -framework Foundation -framework CoreGraphics \
             -arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
             -miphoneos-version-min=15.0 \
             -o SafeMAXBarTweak.dylib tweak/SafeMAXBarTweak.m
