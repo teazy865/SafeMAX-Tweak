@@ -410,10 +410,13 @@ static void styleTabBar(UIView *bar) {
     pill.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:pill.bounds cornerRadius:height / 2.0].CGPath;
     UIVisualEffectView *glass = (UIVisualEffectView *)[pill viewWithTag:7];
     glass.frame = pill.bounds;
-    glass.backgroundColor = [UIColor clearColor];
-    glass.clipsToBounds = NO;
-    glass.layer.cornerRadius = 0;
-    glass.effect = makeGlass();
+    if (!objc_getAssociatedObject(glass, "sm_glass")) {
+        objc_setAssociatedObject(glass, "sm_glass", @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        glass.backgroundColor = [UIColor clearColor];
+        glass.clipsToBounds = NO;
+        glass.layer.cornerRadius = 0;
+        glass.effect = makeGlass();
+    }
     glass.layer.cornerRadius = height / 2.0;
     glass.layer.cornerCurve = kCACornerCurveCircular;
     [bar sendSubviewToBack:pill];
@@ -758,12 +761,46 @@ static void resolveAndHook(void) {
     }];
 }
 
+static void hookLiquidGlassFlag(void);
+
 __attribute__((constructor))
 static void safeMAXDockInit(void) {
+    hookLiquidGlassFlag();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         resolveAndHook();
     });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         resolveAndHook();
     });
+}
+
+static IMP orig_infoDictionary;
+static IMP orig_infoKey;
+static BOOL g_inInfo;
+
+static NSDictionary *swizzled_infoDictionary(id self, SEL _cmd) {
+    NSDictionary *dict = ((NSDictionary *(*)(id, SEL))orig_infoDictionary)(self, _cmd);
+    if (g_inInfo || self != [NSBundle mainBundle] || ![dict isKindOfClass:[NSDictionary class]]) return dict;
+    NSMutableDictionary *copy = [dict mutableCopy];
+    copy[@"UIDesignRequiresCompatibility"] = @NO;
+    return copy;
+}
+
+static id swizzled_infoKey(id self, SEL _cmd, NSString *key) {
+    if (!g_inInfo && self == [NSBundle mainBundle] && [key isEqualToString:@"UIDesignRequiresCompatibility"]) {
+        return @NO;
+    }
+    return ((id (*)(id, SEL, NSString *))orig_infoKey)(self, _cmd, key);
+}
+
+static void hookLiquidGlassFlag(void) {
+    static BOOL hooked;
+    if (hooked) return;
+    hooked = YES;
+    Method info = class_getInstanceMethod([NSBundle class], @selector(infoDictionary));
+    orig_infoDictionary = method_getImplementation(info);
+    method_setImplementation(info, (IMP)swizzled_infoDictionary);
+    Method key = class_getInstanceMethod([NSBundle class], @selector(objectForInfoDictionaryKey:));
+    orig_infoKey = method_getImplementation(key);
+    method_setImplementation(key, (IMP)swizzled_infoKey);
 }
