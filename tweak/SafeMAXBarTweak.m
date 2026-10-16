@@ -899,24 +899,47 @@ static id swizzled_deleteLocal(id self, SEL _cmd, id messageIds, id chat) {
     return ((id (*)(id, SEL, id, id))orig_deleteLocal)(self, _cmd, messageIds, chat);
 }
 
+static IMP orig_setStatus;
+
+static void swizzled_setStatus(id self, SEL _cmd, NSInteger status) {
+    if (keepDeleted() && status == 2) return;
+    ((void (*)(id, SEL, NSInteger))orig_setStatus)(self, _cmd, status);
+}
+
 static void hookKeepDeleted(void) {
-    static BOOL hooked;
-    if (hooked) return;
-    SEL sel = @selector(deleteLocallyMessagesWithIds:updateChat:);
+    static BOOL hookedDelete;
+    static BOOL hookedStatus;
+    if (hookedDelete && hookedStatus) return;
+    SEL deleteSel = @selector(deleteLocallyMessagesWithIds:updateChat:);
+    SEL statusSel = @selector(setStatus:);
     unsigned int count = 0;
     Class *classes = objc_copyClassList(&count);
     if (!classes) return;
-    for (unsigned int i = 0; i < count && !hooked; i++) {
-        unsigned int methodCount = 0;
-        Method *methods = class_copyMethodList(classes[i], &methodCount);
-        for (unsigned int j = 0; j < methodCount; j++) {
-            if (method_getName(methods[j]) != sel) continue;
-            orig_deleteLocal = method_getImplementation(methods[j]);
-            method_setImplementation(methods[j], (IMP)swizzled_deleteLocal);
-            hooked = YES;
-            break;
+    for (unsigned int i = 0; i < count && !(hookedDelete && hookedStatus); i++) {
+        const char *name = class_getName(classes[i]);
+        BOOL messageClass = name && strcmp(name, "OKMMessage") == 0;
+        Class cls = classes[i];
+        while (cls && !(hookedDelete && hookedStatus && !messageClass)) {
+            unsigned int methodCount = 0;
+            Method *methods = class_copyMethodList(cls, &methodCount);
+            for (unsigned int j = 0; j < methodCount; j++) {
+                SEL sel = method_getName(methods[j]);
+                if (!hookedDelete && sel == deleteSel) {
+                    orig_deleteLocal = method_getImplementation(methods[j]);
+                    method_setImplementation(methods[j], (IMP)swizzled_deleteLocal);
+                    hookedDelete = YES;
+                }
+                if (!hookedStatus && messageClass && sel == statusSel) {
+                    orig_setStatus = method_getImplementation(methods[j]);
+                    method_setImplementation(methods[j], (IMP)swizzled_setStatus);
+                    hookedStatus = YES;
+                }
+            }
+            free(methods);
+            if (!messageClass || hookedStatus) break;
+            cls = class_getSuperclass(cls);
+            messageClass = cls != Nil;
         }
-        free(methods);
     }
     free(classes);
 }
@@ -960,13 +983,14 @@ static Ivar sm_textIvar(id text, NSString **value) {
 static IMP orig_setMessageText;
 
 static void swizzled_setMessageText(id self, SEL _cmd, id newText) {
-    if (keepEdits() && newText && [self respondsToSelector:@selector(messageText)]) {
+    if ((keepEdits() || keepDeleted()) && newText && [self respondsToSelector:@selector(messageText)]) {
         id oldText = ((id (*)(id, SEL))objc_msgSend)(self, @selector(messageText));
         NSString *oldString = nil;
         NSString *newString = nil;
         sm_textIvar(oldText, &oldString);
         Ivar ivar = sm_textIvar(newText, &newString);
-        if (oldString.length && newString.length && ![oldString isEqualToString:newString] && [newString rangeOfString:@"—— было ——"].location == NSNotFound) {
+        if (keepDeleted() && oldString.length && newString.length == 0) return;
+        if (keepEdits() && oldString.length && newString.length && ![oldString isEqualToString:newString] && [newString rangeOfString:@"—— было ——"].location == NSNotFound) {
             NSString *combined = [NSString stringWithFormat:@"%@\n—— было ——\n%@", newString, oldString];
             if (ivar) object_setIvar(newText, ivar, combined);
         }
