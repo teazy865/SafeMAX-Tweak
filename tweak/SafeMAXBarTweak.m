@@ -1,5 +1,6 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <QuartzCore/QuartzCore.h>
 
 // SafeMAX bottom dock is OMUIKit.TabBar, not UITabBar.
@@ -7,6 +8,7 @@
 
 static NSString *const kShowLabelsKey = @"SafeMAX_ShowLabels";
 static NSString *const kFloatingKey = @"SafeMAX_FloatingDock";
+static NSString *const kGlassKey = @"SafeMAX_LiquidGlass";
 static NSString *const kOrderKey = @"SafeMAX_TabOrder";
 
 static const NSInteger kEntryTag = 0x5AF1;
@@ -22,6 +24,11 @@ static BOOL g_inSettings;
 
 static BOOL showLabels(void) {
     id obj = [[NSUserDefaults standardUserDefaults] objectForKey:kShowLabelsKey];
+    return obj ? [obj boolValue] : YES;
+}
+
+static BOOL liquidGlass(void) {
+    id obj = [[NSUserDefaults standardUserDefaults] objectForKey:kGlassKey];
     return obj ? [obj boolValue] : YES;
 }
 
@@ -282,16 +289,16 @@ static CGRect chromeBounds(UIView *bar) {
 
 static UIVisualEffect *makeGlass(void) {
     Class cls = NSClassFromString(@"UIGlassEffect");
-    if (cls) {
-        id effect = [[cls alloc] init];
-        if (effect) {
-            if ([effect respondsToSelector:@selector(setInteractive:)]) {
-                [effect setInteractive:YES];
-            }
-            return effect;
+    SEL factory = @selector(effectWithStyle:);
+    if (cls && [cls respondsToSelector:factory]) {
+        // UIGlassEffectStyleRegular. A plain -init paints a solid black or white fill.
+        id effect = ((id (*)(Class, SEL, NSInteger))objc_msgSend)(cls, factory, 0);
+        if ([effect respondsToSelector:@selector(setInteractive:)]) {
+            [effect setInteractive:YES];
         }
+        if (effect) return effect;
     }
-    return [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark];
+    return [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterial];
 }
 
 static void styleTabBar(UIView *bar) {
@@ -340,10 +347,10 @@ static void styleTabBar(UIView *bar) {
         pill.layer.shadowOpacity = 0.28;
         pill.layer.shadowRadius = 18;
         pill.layer.shadowOffset = CGSizeMake(0, 8);
-        UIVisualEffectView *glass = [[UIVisualEffectView alloc] initWithEffect:makeGlass()];
+        UIVisualEffectView *glass = [[UIVisualEffectView alloc] initWithEffect:nil];
         glass.tag = 7;
         glass.userInteractionEnabled = NO;
-        glass.clipsToBounds = YES;
+        glass.backgroundColor = [UIColor clearColor];
         glass.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         [pill addSubview:glass];
         [bar insertSubview:pill atIndex:0];
@@ -352,8 +359,30 @@ static void styleTabBar(UIView *bar) {
     pill.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:pill.bounds cornerRadius:height / 2.0].CGPath;
     UIVisualEffectView *glass = (UIVisualEffectView *)[pill viewWithTag:7];
     glass.frame = pill.bounds;
-    glass.layer.cornerRadius = height / 2.0;
-    glass.layer.cornerCurve = kCACornerCurveCircular;
+    NSNumber *mode = @(liquidGlass());
+    if (![(NSNumber *)objc_getAssociatedObject(glass, "sm_mode") isEqualToNumber:mode]) {
+        objc_setAssociatedObject(glass, "sm_mode", mode, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (liquidGlass()) {
+            glass.backgroundColor = [UIColor clearColor];
+            glass.clipsToBounds = NO;
+            glass.layer.cornerRadius = 0;
+            glass.effect = makeGlass();
+        } else {
+            glass.effect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterial];
+            glass.effect = nil;
+            glass.clipsToBounds = YES;
+            glass.layer.cornerRadius = height / 2.0;
+            glass.backgroundColor = [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *trait) {
+                return trait.userInterfaceStyle == UIUserInterfaceStyleDark
+                    ? [UIColor colorWithWhite:0.07 alpha:0.94]
+                    : [UIColor colorWithWhite:1 alpha:0.94];
+            }];
+        }
+    }
+    if (liquidGlass()) {
+        glass.layer.cornerRadius = height / 2.0;
+        glass.layer.cornerCurve = kCACornerCurveCircular;
+    }
     [bar sendSubviewToBack:pill];
 }
 
@@ -460,8 +489,10 @@ static void presentEditor(UIViewController *from);
     NSNumber *row = objc_getAssociatedObject(sender, "sm_row");
     if (row.integerValue == 0) {
         [[NSUserDefaults standardUserDefaults] setBool:sender.on forKey:kShowLabelsKey];
-    } else {
+    } else if (row.integerValue == 1) {
         [[NSUserDefaults standardUserDefaults] setBool:sender.on forKey:kFloatingKey];
+    } else {
+        [[NSUserDefaults standardUserDefaults] setBool:sender.on forKey:kGlassKey];
     }
     styleAllBars();
 }
@@ -469,7 +500,7 @@ static void presentEditor(UIViewController *from);
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 2; }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return section == 0 ? 2 : self.titles.count;
+    return section == 0 ? 3 : self.titles.count;
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
@@ -477,7 +508,8 @@ static void presentEditor(UIViewController *from);
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
-    return section == 1 ? @"Удерживайте полоски справа и перетаскивайте вкладки." : nil;
+    if (section == 0) return @"Жидкое стекло включает оформление iOS 26 во всём приложении. Закройте MAX и откройте снова, чтобы оно применилось.";
+    return @"Удерживайте полоски справа и перетаскивайте вкладки.";
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -488,7 +520,16 @@ static void presentEditor(UIViewController *from);
     cell.selectionStyle = UITableViewCellSelectionStyleNone;
     UISwitch *toggle = [cell.contentView viewWithTag:9];
     if (indexPath.section == 0) {
-        cell.textLabel.text = indexPath.row == 0 ? @"Текст под иконками" : @"Парящий док";
+        NSString *title = @"Парящий док";
+        BOOL on = floatingDock();
+        if (indexPath.row == 0) {
+            title = @"Текст под иконками";
+            on = showLabels();
+        } else if (indexPath.row == 2) {
+            title = @"Жидкое стекло";
+            on = liquidGlass();
+        }
+        cell.textLabel.text = title;
         if (!toggle) {
             toggle = [[UISwitch alloc] init];
             toggle.tag = 9;
@@ -501,7 +542,7 @@ static void presentEditor(UIViewController *from);
             ]];
         }
         toggle.hidden = NO;
-        toggle.on = indexPath.row == 0 ? showLabels() : floatingDock();
+        toggle.on = on;
         objc_setAssociatedObject(toggle, "sm_row", @(indexPath.row), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     } else {
         cell.textLabel.text = self.titles[indexPath.row];
@@ -682,8 +723,47 @@ static void resolveAndHook(void) {
     method_setImplementation(appear, (IMP)swizzled_appear);
 }
 
+static IMP orig_infoDictionary;
+static IMP orig_infoKey;
+
+static BOOL g_inInfo;
+
+static NSDictionary *swizzled_infoDictionary(id self, SEL _cmd) {
+    NSDictionary *dict = ((NSDictionary *(*)(id, SEL))orig_infoDictionary)(self, _cmd);
+    if (g_inInfo || self != [NSBundle mainBundle] || ![dict isKindOfClass:[NSDictionary class]]) return dict;
+    g_inInfo = YES;
+    BOOL glass = liquidGlass();
+    g_inInfo = NO;
+    NSMutableDictionary *copy = [dict mutableCopy];
+    copy[@"UIDesignRequiresCompatibility"] = glass ? @NO : @YES;
+    return copy;
+}
+
+static id swizzled_infoKey(id self, SEL _cmd, NSString *key) {
+    if (!g_inInfo && self == [NSBundle mainBundle] && [key isEqualToString:@"UIDesignRequiresCompatibility"]) {
+        g_inInfo = YES;
+        BOOL glass = liquidGlass();
+        g_inInfo = NO;
+        return glass ? @NO : @YES;
+    }
+    return ((id (*)(id, SEL, NSString *))orig_infoKey)(self, _cmd, key);
+}
+
+static void hookLiquidGlassFlag(void) {
+    static BOOL hooked;
+    if (hooked) return;
+    hooked = YES;
+    Method info = class_getInstanceMethod([NSBundle class], @selector(infoDictionary));
+    orig_infoDictionary = method_getImplementation(info);
+    method_setImplementation(info, (IMP)swizzled_infoDictionary);
+    Method key = class_getInstanceMethod([NSBundle class], @selector(objectForInfoDictionaryKey:));
+    orig_infoKey = method_getImplementation(key);
+    method_setImplementation(key, (IMP)swizzled_infoKey);
+}
+
 __attribute__((constructor))
 static void safeMAXDockInit(void) {
+    hookLiquidGlassFlag();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         resolveAndHook();
     });
