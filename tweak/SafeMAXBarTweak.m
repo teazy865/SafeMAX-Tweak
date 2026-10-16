@@ -1,5 +1,6 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <QuartzCore/QuartzCore.h>
 
 // SafeMAX bottom dock is OMUIKit.TabBar, not UITabBar.
 // Never hide or fade existing subviews: that removes the icons.
@@ -9,6 +10,7 @@ static NSString *const kFloatingKey = @"SafeMAX_FloatingDock";
 static NSString *const kOrderKey = @"SafeMAX_TabOrder";
 
 static const NSInteger kEntryTag = 0x5AF1;
+static const NSInteger kPillTag = 0x5AF3;
 
 static Class TabBarClass;
 static Class SettingsClass;
@@ -196,18 +198,163 @@ static BOOL isBottomBar(UIView *bar) {
     return tabTitleCount(bar) >= 3;
 }
 
+static BOOL viewHasChrome(UIView *view) {
+    if (!view || view.tag == kPillTag) return NO;
+    if ([view isKindOfClass:[UILabel class]] && ((UILabel *)view).text.length > 0) return YES;
+    if ([view isKindOfClass:[UIImageView class]] && ((UIImageView *)view).image) return YES;
+    if ([view isKindOfClass:[UIControl class]]) return YES;
+    for (UIView *sub in view.subviews) {
+        if (viewHasChrome(sub)) return YES;
+    }
+    return NO;
+}
+
+static void rememberOnce(UIView *view, const void *key, id value) {
+    if (!objc_getAssociatedObject(view, key)) {
+        objc_setAssociatedObject(view, key, value ?: [NSNull null], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+static void setBackdropHidden(UIView *view, BOOL hidden) {
+    if (hidden) {
+        rememberOnce(view, "sm_alpha", @(view.alpha));
+        view.alpha = 0;
+    } else if (objc_getAssociatedObject(view, "sm_alpha")) {
+        view.alpha = [objc_getAssociatedObject(view, "sm_alpha") doubleValue];
+    }
+}
+
+static void clearFill(UIView *view, BOOL clear) {
+    if (clear) {
+        rememberOnce(view, "sm_bg", view.backgroundColor ?: [NSNull null]);
+        view.backgroundColor = [UIColor clearColor];
+        view.opaque = NO;
+    } else {
+        id bg = objc_getAssociatedObject(view, "sm_bg");
+        if (bg && bg != [NSNull null]) view.backgroundColor = bg;
+    }
+}
+
+static void clearEffect(UIView *view, BOOL clear) {
+    if (![view isKindOfClass:[UIVisualEffectView class]]) return;
+    UIVisualEffectView *effectView = (UIVisualEffectView *)view;
+    if (clear) {
+        rememberOnce(effectView, "sm_fx", effectView.effect ?: [NSNull null]);
+        effectView.effect = nil;
+        effectView.backgroundColor = [UIColor clearColor];
+    } else {
+        id effect = objc_getAssociatedObject(effectView, "sm_fx");
+        if (effect && effect != [NSNull null]) effectView.effect = effect;
+    }
+}
+
+static void stripBackdrops(UIView *view, BOOL floating) {
+    for (UIView *sub in view.subviews) {
+        if (sub.tag == kPillTag) continue;
+        if (viewHasChrome(sub)) {
+            clearFill(sub, floating);
+            clearEffect(sub, floating);
+            stripBackdrops(sub, floating);
+        } else {
+            setBackdropHidden(sub, floating);
+        }
+    }
+}
+
+static CGRect chromeBounds(UIView *bar) {
+    __block CGRect box = CGRectNull;
+    __block void (^recurse)(UIView *);
+    recurse = ^(UIView *view) {
+        if (!view || view.tag == kPillTag || view.hidden || view.alpha < 0.05) return;
+        BOOL glyph = ([view isKindOfClass:[UILabel class]] && ((UILabel *)view).text.length > 0) ||
+                     ([view isKindOfClass:[UIImageView class]] && ((UIImageView *)view).image != nil);
+        if (glyph) {
+            CGRect frame = [view convertRect:view.bounds toView:bar];
+            if (frame.size.width > 1 && frame.size.height > 1) {
+                box = CGRectIsNull(box) ? frame : CGRectUnion(box, frame);
+            }
+        }
+        for (UIView *child in view.subviews) recurse(child);
+    };
+    recurse(bar);
+    return box;
+}
+
+static UIVisualEffect *makeGlass(void) {
+    Class cls = NSClassFromString(@"UIGlassEffect");
+    if (cls) {
+        id effect = [[cls alloc] init];
+        if (effect) {
+            if ([effect respondsToSelector:@selector(setInteractive:)]) {
+                [effect setInteractive:YES];
+            }
+            return effect;
+        }
+    }
+    return [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark];
+}
+
 static void styleTabBar(UIView *bar) {
     if (!isBottomBar(bar)) return;
     applyLabels(bar);
     applyOrder(bar);
 
     BOOL floating = floatingDock();
-    bar.clipsToBounds = floating;
-    bar.layer.cornerRadius = floating ? 28 : 0;
-    bar.layer.borderWidth = floating ? 0.6 : 0;
-    bar.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.18].CGColor;
-    // Scale instead of changing the frame so Auto Layout cannot hide the bar.
-    bar.transform = floating ? CGAffineTransformMakeScale(0.90, 0.92) : CGAffineTransformIdentity;
+    bar.transform = CGAffineTransformIdentity;
+    bar.clipsToBounds = NO;
+    bar.layer.cornerRadius = 0;
+    bar.layer.borderWidth = 0;
+    if (floating) {
+        rememberOnce(bar, "sm_barbg", bar.backgroundColor ?: [NSNull null]);
+        bar.backgroundColor = [UIColor clearColor];
+        bar.opaque = NO;
+        bar.layer.backgroundColor = UIColor.clearColor.CGColor;
+    } else {
+        id bg = objc_getAssociatedObject(bar, "sm_barbg");
+        if (bg && bg != [NSNull null]) bar.backgroundColor = bg;
+    }
+    stripBackdrops(bar, floating);
+
+    UIView *pill = [bar viewWithTag:kPillTag];
+    if (!floating) {
+        [pill removeFromSuperview];
+        return;
+    }
+
+    CGRect glyphs = chromeBounds(bar);
+    if (CGRectIsNull(glyphs)) return;
+    CGFloat side = 18;
+    CGFloat padY = 9;
+    CGFloat height = MAX(56, CGRectGetHeight(glyphs) + padY * 2);
+    CGFloat y = CGRectGetMidY(glyphs) - height / 2.0;
+    if (y < 2) y = 2;
+    if (y + height > bar.bounds.size.height - 2) y = MAX(2, bar.bounds.size.height - 2 - height);
+    CGRect frame = CGRectMake(side, y, bar.bounds.size.width - side * 2, height);
+
+    if (!pill) {
+        pill = [[UIView alloc] initWithFrame:frame];
+        pill.tag = kPillTag;
+        pill.userInteractionEnabled = NO;
+        pill.backgroundColor = [UIColor clearColor];
+        pill.layer.shadowColor = [UIColor blackColor].CGColor;
+        pill.layer.shadowOpacity = 0.28;
+        pill.layer.shadowRadius = 18;
+        pill.layer.shadowOffset = CGSizeMake(0, 8);
+        UIVisualEffectView *glass = [[UIVisualEffectView alloc] initWithEffect:makeGlass()];
+        glass.tag = 7;
+        glass.userInteractionEnabled = NO;
+        glass.clipsToBounds = YES;
+        glass.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [pill addSubview:glass];
+        [bar insertSubview:pill atIndex:0];
+    }
+    pill.frame = frame;
+    pill.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:pill.bounds cornerRadius:height / 2.0].CGPath;
+    UIVisualEffectView *glass = (UIVisualEffectView *)[pill viewWithTag:7];
+    glass.frame = pill.bounds;
+    glass.layer.cornerRadius = height / 2.0;
+    glass.layer.cornerCurve = kCACornerCurveCircular;
+    [bar sendSubviewToBack:pill];
 }
 
 static UIView *locateBar(void) {
