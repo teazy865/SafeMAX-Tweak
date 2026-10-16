@@ -1,0 +1,73 @@
+name: Build SafeMAX Tweak IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: "URL to the original SafeMAX IPA (or leave empty to use attached)"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          brew install ldid
+          # insert_dylib
+          git clone https://github.com/tyilo/insert_dylib.git /tmp/insert_dylib
+          cd /tmp/insert_dylib && xcodebuild -scheme insert_dylib -configuration Release
+          sudo cp /tmp/insert_dylib/build/Release/insert_dylib /usr/local/bin/
+
+      - name: Download IPA
+        run: |
+          if [ -n "${{ github.event.inputs.ipa_url }}" ]; then
+            curl -L -o SafeMAX.ipa "${{ github.event.inputs.ipa_url }}"
+          else
+            echo "No IPA URL provided. Place SafeMAX.ipa in the repo root or pass a URL."
+            exit 1
+          fi
+
+      - name: Extract IPA
+        run: |
+          unzip -q SafeMAX.ipa -d extracted
+          APP=$(find extracted/Payload -name "*.app" | head -1)
+          echo "APP=$APP" >> $GITHUB_ENV
+
+      - name: Build tweak dylib
+        run: |
+          clang -dynamiclib -framework UIKit -framework Foundation \
+            -arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+            -miphoneos-version-min=15.0 \
+            -o SafeMAXBarTweak.dylib tweak/SafeMAXBarTweak.m
+          # Sign the dylib
+          ldid -S SafeMAXBarTweak.dylib
+
+      - name: Inject dylib
+        run: |
+          cp SafeMAXBarTweak.dylib "$APP/"
+          # Inject load command
+          insert_dylib @executable_path/SafeMAXBarTweak.dylib "$APP/MAX" --inplace --all-yes || \
+          insert_dylib @executable_path/SafeMAXBarTweak.dylib "$APP/MAX" --inplace
+
+      - name: Resign app
+        run: |
+          # Resign main binary and dylibs
+          ldid -S "$APP/MAX"
+          find "$APP" -name "*.dylib" -exec ldid -S {} \;
+          # Extensions
+          find "$APP/PlugIns" -name "*.appex" -exec sh -c 'ldid -S "$1/$(basename "$1" .appex)"' _ {} \; 2>/dev/null || true
+
+      - name: Package IPA
+        run: |
+          cd extracted && zip -qr ../SafeMAX-tweaked.ipa Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: SafeMAX-tweaked
+          path: SafeMAX-tweaked.ipa
+          retention-days: 30
