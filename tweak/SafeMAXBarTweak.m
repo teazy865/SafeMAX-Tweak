@@ -95,5 +95,5 @@ static void init(void) {
     });
 
     // Also re-apply periodically in case the app recreates the bar
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), applyToAllTabBars);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ applyToAllTabBars(); });
 }
