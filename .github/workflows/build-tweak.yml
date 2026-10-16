@@ -19,8 +19,8 @@ jobs:
           brew install ldid
           # insert_dylib
           git clone https://github.com/tyilo/insert_dylib.git /tmp/insert_dylib
-          cd /tmp/insert_dylib && xcodebuild -scheme insert_dylib -configuration Release
-          sudo cp /tmp/insert_dylib/build/Release/insert_dylib /usr/local/bin/
+          cd /tmp/insert_dylib && xcodebuild -scheme insert_dylib -configuration Release -derivedDataPath /tmp/insert_dylib_dd
+          sudo cp /tmp/insert_dylib_dd/Build/Products/Release/insert_dylib /usr/local/bin/
 
       - name: Download IPA
         run: |
