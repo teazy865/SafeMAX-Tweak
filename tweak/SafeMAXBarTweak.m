@@ -47,9 +47,16 @@ static BOOL antiRead(void) {
     return obj ? [obj boolValue] : NO;
 }
 
+static BOOL g_keepDeleted;
+static BOOL g_keepDeletedLoaded;
+
 static BOOL keepDeleted(void) {
-    id obj = [[NSUserDefaults standardUserDefaults] objectForKey:kKeepDeletedKey];
-    return obj ? [obj boolValue] : NO;
+    if (!g_keepDeletedLoaded) {
+        id obj = [[NSUserDefaults standardUserDefaults] objectForKey:kKeepDeletedKey];
+        g_keepDeleted = obj ? [obj boolValue] : NO;
+        g_keepDeletedLoaded = YES;
+    }
+    return g_keepDeleted;
 }
 
 static BOOL keepEdits(void) {
@@ -691,6 +698,10 @@ static void presentEditor(UIViewController *from) {
         default: break;
     }
     [[NSUserDefaults standardUserDefaults] setBool:sender.on forKey:key];
+    if (key == kKeepDeletedKey) {
+        g_keepDeleted = sender.on;
+        g_keepDeletedLoaded = YES;
+    }
 }
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 1; }
@@ -893,24 +904,55 @@ static void hookAntiRead(void) {
 }
 
 static IMP orig_deleteLocal;
+static IMP orig_setStatus;
+static IMP orig_status;
+static IMP orig_messagesDeleted;
+static IMP orig_delayedDeleted;
+static IMP orig_sendNextSubject;
+static IMP orig_sendNextReplay;
+static IMP orig_sendNextBehavior;
+static IMP orig_sendNextPass;
+static Class smMessageClass;
+
+static BOOL sm_hook_own(Class cls, const char *selName, IMP replacement, IMP *origOut) {
+    if (!cls || !origOut || *origOut) return origOut && *origOut;
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
+    BOOL found = NO;
+    for (unsigned int i = 0; methods && i < count; i++) {
+        const char *name = sel_getName(method_getName(methods[i]));
+        if (!name || strcmp(name, selName) != 0) continue;
+        *origOut = method_getImplementation(methods[i]);
+        if (*origOut != replacement) method_setImplementation(methods[i], replacement);
+        found = YES;
+        break;
+    }
+    free(methods);
+    return found;
+}
+
+static BOOL sm_isRemovalEvent(id value) {
+    if (!value) return NO;
+    const char *name = class_getName(object_getClass(value));
+    if (!name || !strstr(name, "ChatEvent")) return NO;
+    SEL typeSel = @selector(type);
+    if (![value respondsToSelector:typeSel]) return NO;
+    unsigned long long type = ((unsigned long long (*)(id, SEL))objc_msgSend)(value, typeSel);
+    return type == 3;
+}
 
 static id swizzled_deleteLocal(id self, SEL _cmd, id messageIds, id chat) {
     if (keepDeleted()) return nil;
     return ((id (*)(id, SEL, id, id))orig_deleteLocal)(self, _cmd, messageIds, chat);
 }
 
-static IMP orig_setStatus;
-static IMP orig_status;
-static IMP orig_messagesDeleted;
-static Class smMessageClass;
-
-static void swizzled_setStatus(id self, SEL _cmd, NSInteger status) {
+static void swizzled_setStatus(id self, SEL _cmd, NSUInteger status) {
     if (keepDeleted() && status == 2 && smMessageClass && [self isKindOfClass:smMessageClass]) return;
-    ((void (*)(id, SEL, NSInteger))orig_setStatus)(self, _cmd, status);
+    ((void (*)(id, SEL, NSUInteger))orig_setStatus)(self, _cmd, status);
 }
 
-static NSInteger swizzled_status(id self, SEL _cmd) {
-    NSInteger status = ((NSInteger (*)(id, SEL))orig_status)(self, _cmd);
+static NSUInteger swizzled_status(id self, SEL _cmd) {
+    NSUInteger status = ((NSUInteger (*)(id, SEL))orig_status)(self, _cmd);
     if (keepDeleted() && status == 2 && smMessageClass && [self isKindOfClass:smMessageClass]) return 0;
     return status;
 }
@@ -920,56 +962,46 @@ static void swizzled_messagesDeleted(id self, SEL _cmd, id messages, id chat) {
     ((void (*)(id, SEL, id, id))orig_messagesDeleted)(self, _cmd, messages, chat);
 }
 
-static void hookKeepDeleted(void) {
-    static BOOL hookedDelete;
-    static BOOL hookedStatus;
-    static BOOL hookedGetter;
-    static BOOL hookedMessagesDeleted;
-    if (hookedDelete && hookedStatus && hookedGetter && hookedMessagesDeleted) return;
-    if (!smMessageClass) smMessageClass = objc_getClass("OKMMessage");
-    SEL deleteSel = @selector(deleteLocallyMessagesWithIds:updateChat:);
-    SEL statusSel = @selector(setStatus:);
-    SEL getterSel = @selector(status);
-    SEL deletedSel = @selector(_messagesDeleted:inChat:);
-    if (smMessageClass && !hookedStatus) {
-        Method method = class_getInstanceMethod(smMessageClass, statusSel);
-        if (method) {
-            orig_setStatus = method_getImplementation(method);
-            method_setImplementation(method, (IMP)swizzled_setStatus);
-            hookedStatus = YES;
-        }
-    }
-    if (smMessageClass && !hookedGetter) {
-        Method method = class_getInstanceMethod(smMessageClass, getterSel);
-        if (method) {
-            orig_status = method_getImplementation(method);
-            method_setImplementation(method, (IMP)swizzled_status);
-            hookedGetter = YES;
-        }
-    }
-    unsigned int count = 0;
-    Class *classes = objc_copyClassList(&count);
-    if (!classes) return;
-    for (unsigned int i = 0; i < count && !(hookedDelete && hookedMessagesDeleted); i++) {
-        unsigned int methodCount = 0;
-        Method *methods = class_copyMethodList(classes[i], &methodCount);
-        for (unsigned int j = 0; j < methodCount; j++) {
-            SEL sel = method_getName(methods[j]);
-            if (!hookedDelete && sel == deleteSel) {
-                orig_deleteLocal = method_getImplementation(methods[j]);
-                method_setImplementation(methods[j], (IMP)swizzled_deleteLocal);
-                hookedDelete = YES;
-            }
-            if (!hookedMessagesDeleted && sel == deletedSel) {
-                orig_messagesDeleted = method_getImplementation(methods[j]);
-                method_setImplementation(methods[j], (IMP)swizzled_messagesDeleted);
-                hookedMessagesDeleted = YES;
-            }
-        }
-        free(methods);
-    }
-    free(classes);
+static void swizzled_delayedDeleted(id self, SEL _cmd, id notification) {
+    if (keepDeleted()) return;
+    ((void (*)(id, SEL, id))orig_delayedDeleted)(self, _cmd, notification);
 }
+
+static void swizzled_sendNextSubject(id self, SEL _cmd, id value) {
+    if (keepDeleted() && sm_isRemovalEvent(value)) return;
+    ((void (*)(id, SEL, id))orig_sendNextSubject)(self, _cmd, value);
+}
+
+static void swizzled_sendNextReplay(id self, SEL _cmd, id value) {
+    if (keepDeleted() && sm_isRemovalEvent(value)) return;
+    ((void (*)(id, SEL, id))orig_sendNextReplay)(self, _cmd, value);
+}
+
+static void swizzled_sendNextBehavior(id self, SEL _cmd, id value) {
+    if (keepDeleted() && sm_isRemovalEvent(value)) return;
+    ((void (*)(id, SEL, id))orig_sendNextBehavior)(self, _cmd, value);
+}
+
+static void swizzled_sendNextPass(id self, SEL _cmd, id value) {
+    if (keepDeleted() && sm_isRemovalEvent(value)) return;
+    ((void (*)(id, SEL, id))orig_sendNextPass)(self, _cmd, value);
+}
+
+static void hookKeepDeleted(void) {
+    if (!smMessageClass) smMessageClass = objc_getClass("OKMMessage");
+    sm_hook_own(smMessageClass, "setStatus:", (IMP)swizzled_setStatus, &orig_setStatus);
+    sm_hook_own(smMessageClass, "status", (IMP)swizzled_status, &orig_status);
+    sm_hook_own(objc_getClass("OKMChatService"), "deleteLocallyMessagesWithIds:updateChat:", (IMP)swizzled_deleteLocal, &orig_deleteLocal);
+    Class listener = objc_getClass("OKMMessageDeleteListener");
+    sm_hook_own(listener, "_messagesDeleted:inChat:", (IMP)swizzled_messagesDeleted, &orig_messagesDeleted);
+    sm_hook_own(listener, "_delayedMessagesDeleted:", (IMP)swizzled_delayedDeleted, &orig_delayedDeleted);
+    sm_hook_own(objc_getClass("RACSubject"), "sendNext:", (IMP)swizzled_sendNextSubject, &orig_sendNextSubject);
+    sm_hook_own(objc_getClass("RACReplaySubject"), "sendNext:", (IMP)swizzled_sendNextReplay, &orig_sendNextReplay);
+    sm_hook_own(objc_getClass("RACBehaviorSubject"), "sendNext:", (IMP)swizzled_sendNextBehavior, &orig_sendNextBehavior);
+    sm_hook_own(objc_getClass("RACPassthroughSubscriber"), "sendNext:", (IMP)swizzled_sendNextPass, &orig_sendNextPass);
+}
+
+static Ivar sm_textIvar(id text, NSString **value) {
 
 static Ivar sm_textIvar(id text, NSString **value) {
     if (!text || [text isKindOfClass:[NSString class]]) {
@@ -1111,9 +1143,11 @@ static void resolveAndHook(void) {
     static id activeObserver;
     static id foregroundObserver;
     activeObserver = [center addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
+        hookKeepDeleted();
         scheduleRestyle();
     }];
     foregroundObserver = [center addObserverForName:UIApplicationWillEnterForegroundNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
+        hookKeepDeleted();
         scheduleRestyle();
     }];
 }
@@ -1132,6 +1166,9 @@ static void safeMAXDockInit(void) {
     });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         resolveAndHook();
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        hookKeepDeleted();
     });
 }
 
