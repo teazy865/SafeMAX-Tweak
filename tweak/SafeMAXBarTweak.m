@@ -364,6 +364,7 @@ static void layoutDockSlots(UIView *bar) {
 }
 
 static UIVisualEffect *makeGlass(void);
+static void shapeGlass(UIView *view);
 
 static CGFloat accentScore(UIColor *color) {
     if (!color) return 0;
@@ -426,9 +427,11 @@ static void placeSelection(UIView *bar, UIView *forced, BOOL dragging) {
         mark.layer.cornerCurve = kCACornerCurveContinuous;
         if (glass) {
             mark.clipsToBounds = NO;
-            mark.layer.cornerRadius = height / 2.0;
+            mark.layer.masksToBounds = NO;
+            mark.layer.cornerRadius = 0;
             mark.backgroundColor = [UIColor clearColor];
             mark.effect = makeGlass();
+            shapeGlass(mark);
         } else {
             mark.clipsToBounds = YES;
             mark.layer.cornerRadius = MIN(26, height / 2.0);
@@ -511,6 +514,21 @@ static UIVisualEffect *makeGlass(void) {
     return [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterial];
 }
 
+// layer.cornerRadius flattens UIGlassEffect into a solid fill. The system capsule
+// shape has to come from UICornerConfiguration, which leaves the material intact.
+static void shapeGlass(UIView *view) {
+    view.clipsToBounds = NO;
+    view.layer.masksToBounds = NO;
+    view.layer.cornerRadius = 0;
+    view.backgroundColor = [UIColor clearColor];
+    Class cfg = NSClassFromString(@"UICornerConfiguration");
+    SEL capsule = NSSelectorFromString(@"capsuleConfiguration");
+    SEL setter = NSSelectorFromString(@"setCornerConfiguration:");
+    if (!cfg || ![cfg respondsToSelector:capsule] || ![view respondsToSelector:setter]) return;
+    id shape = ((id (*)(Class, SEL))objc_msgSend)(cfg, capsule);
+    if (shape) ((void (*)(id, SEL, id))objc_msgSend)(view, setter, shape);
+}
+
 static void styleTabBar(UIView *bar) {
     if (!isBottomBar(bar)) return;
     applyLabels(bar);
@@ -579,14 +597,16 @@ static void styleTabBar(UIView *bar) {
         objc_setAssociatedObject(glass, "sm_mode", mode, OBJC_ASSOCIATION_COPY_NONATOMIC);
         if (liquidGlass()) {
             glass.backgroundColor = [UIColor clearColor];
-            glass.clipsToBounds = NO;
-            glass.layer.cornerRadius = 0;
             glass.effect = makeGlass();
+            shapeGlass(glass);
         } else {
             glass.effect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterial];
             glass.effect = nil;
             glass.clipsToBounds = YES;
             glass.layer.cornerRadius = height / 2.0;
+            if ([glass respondsToSelector:NSSelectorFromString(@"setCornerConfiguration:")]) {
+                ((void (*)(id, SEL, id))objc_msgSend)(glass, NSSelectorFromString(@"setCornerConfiguration:"), nil);
+            }
             glass.backgroundColor = [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *trait) {
                 return trait.userInterfaceStyle == UIUserInterfaceStyleDark
                     ? [UIColor colorWithWhite:0.07 alpha:0.94]
@@ -594,10 +614,7 @@ static void styleTabBar(UIView *bar) {
             }];
         }
     }
-    if (liquidGlass()) {
-        glass.layer.cornerRadius = height / 2.0;
-        glass.layer.cornerCurve = kCACornerCurveCircular;
-    }
+    if (liquidGlass()) shapeGlass(glass);
     [bar sendSubviewToBack:pill];
     installDrag(bar);
     if (!objc_getAssociatedObject(bar, "sm_dragTitle")) placeSelection(bar, nil, NO);
