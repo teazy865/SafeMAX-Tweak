@@ -81,23 +81,6 @@ static UIView *findKind(UIView *view, Class cls) {
     return nil;
 }
 
-static UITableView *findTable(UIView *view) {
-    if (!view) return nil;
-    if ([view isKindOfClass:[UITableView class]]) return (UITableView *)view;
-    UITableView *best = nil;
-    CGFloat bestArea = 0;
-    for (UIView *sub in view.subviews) {
-        UITableView *table = findTable(sub);
-        if (!table) continue;
-        CGFloat area = table.bounds.size.width * table.bounds.size.height;
-        if (area >= bestArea) {
-            best = table;
-            bestArea = area;
-        }
-    }
-    return best;
-}
-
 static NSInteger tabTitleCount(UIView *view) {
     __block NSInteger count = 0;
     eachLabel(view, ^(UILabel *label) {
@@ -264,8 +247,8 @@ static void presentEditor(UIViewController *from);
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (!self) return nil;
-    self.backgroundColor = [UIColor colorWithRed:0.16 green:0.16 blue:0.18 alpha:1];
-    self.layer.cornerRadius = 20;
+    self.backgroundColor = [UIColor colorWithWhite:0.15 alpha:1];
+    self.layer.cornerRadius = 22;
     self.clipsToBounds = YES;
     [self addTarget:self action:@selector(open) forControlEvents:UIControlEventTouchUpInside];
 
@@ -282,16 +265,9 @@ static void presentEditor(UIViewController *from);
     title.font = [UIFont systemFontOfSize:17];
     [self addSubview:title];
 
-    UILabel *detail = [[UILabel alloc] init];
-    detail.tag = 3;
-    detail.text = @"Форма, подписи и порядок";
-    detail.textColor = [UIColor colorWithWhite:1 alpha:0.45];
-    detail.font = [UIFont systemFontOfSize:13];
-    [self addSubview:detail];
-
-    UIImageView *chevron = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"chevron.right"]];
+    UIImageView *chevron = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"chevron.right" withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:13 weight:UIFontWeightSemibold]]];
     chevron.tag = 4;
-    chevron.tintColor = [UIColor colorWithWhite:1 alpha:0.35];
+    chevron.tintColor = [UIColor colorWithWhite:1 alpha:0.28];
     chevron.contentMode = UIViewContentModeScaleAspectFit;
     [self addSubview:chevron];
     return self;
@@ -299,10 +275,9 @@ static void presentEditor(UIViewController *from);
 
 - (void)layoutSubviews {
     [super layoutSubviews];
-    [self viewWithTag:1].frame = CGRectMake(16, 18, 24, 24);
-    [self viewWithTag:4].frame = CGRectMake(self.bounds.size.width - 28, 23, 12, 16);
-    [self viewWithTag:2].frame = CGRectMake(52, 10, self.bounds.size.width - 90, 22);
-    [self viewWithTag:3].frame = CGRectMake(52, 32, self.bounds.size.width - 90, 18);
+    [self viewWithTag:1].frame = CGRectMake(16, (self.bounds.size.height - 24) / 2.0, 24, 24);
+    [self viewWithTag:4].frame = CGRectMake(self.bounds.size.width - 28, (self.bounds.size.height - 14) / 2.0, 12, 14);
+    [self viewWithTag:2].frame = CGRectMake(56, 0, self.bounds.size.width - 96, self.bounds.size.height);
 }
 
 - (void)setHighlighted:(BOOL)highlighted {
@@ -441,49 +416,76 @@ static void presentEditor(UIViewController *from) {
     [from presentViewController:nav animated:YES completion:nil];
 }
 
+static UIScrollView *findMainScroll(UIView *view) {
+    UIScrollView *best = nil;
+    CGFloat bestHeight = 0;
+    if ([view isKindOfClass:[UIScrollView class]] && view.bounds.size.height > bestHeight) {
+        best = (UIScrollView *)view;
+        bestHeight = view.bounds.size.height;
+    }
+    for (UIView *sub in view.subviews) {
+        UIScrollView *found = findMainScroll(sub);
+        if (found && found.bounds.size.height > bestHeight) {
+            best = found;
+            bestHeight = found.bounds.size.height;
+        }
+    }
+    return best;
+}
+
+static UIColor *cardColorFromScroll(UIScrollView *scroll) {
+    if (@available(iOS 14.0, *)) {
+        if ([scroll isKindOfClass:[UICollectionView class]]) {
+            for (UICollectionViewCell *cell in ((UICollectionView *)scroll).visibleCells) {
+                UIColor *color = cell.backgroundConfiguration.backgroundColor;
+                if (color) return color;
+                if (cell.backgroundView.backgroundColor) return cell.backgroundView.backgroundColor;
+            }
+        }
+    }
+    return [UIColor colorWithWhite:0.15 alpha:1];
+}
+
 static void installSettingsEntry(UIViewController *vc) {
     if (g_inSettings || (SettingsClass && ![vc isKindOfClass:SettingsClass])) return;
     g_inSettings = YES;
 
-    UITableView *table = findTable(vc.view);
-    if (!table || table.bounds.size.width < 20) {
+    UIScrollView *scroll = findMainScroll(vc.view);
+    if (!scroll || scroll.bounds.size.width < 40 || scroll.contentSize.height < 80) {
         g_inSettings = NO;
         return;
     }
 
-    // Drop the row if a previous layout stuck it over the profile cards.
-    UIView *stray = [vc.view viewWithTag:kEntryTag];
-    if (stray && stray != table.tableFooterView && ![stray isDescendantOfView:table.tableFooterView]) {
-        [stray removeFromSuperview];
-    }
-
-    if (!objc_getAssociatedObject(table, "sm_inset")) {
-        UIEdgeInsets inset = table.contentInset;
-        inset.bottom += 88;
-        table.contentInset = inset;
-        table.verticalScrollIndicatorInsets = inset;
-        objc_setAssociatedObject(table, "sm_inset", @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-
-    if (table.tableFooterView.tag != kEntryTag) {
-        CGFloat width = table.bounds.size.width;
-        UIView *existing = table.tableFooterView;
-        CGFloat existingH = existing ? existing.bounds.size.height : 0;
-        UIView *wrap = [[UIView alloc] initWithFrame:CGRectMake(0, 0, width, existingH + 108)];
-        wrap.tag = kEntryTag;
-        wrap.backgroundColor = [UIColor clearColor];
-        if (existing) {
-            existing.tag = 0;
-            existing.frame = CGRectMake(0, 0, width, existingH);
-            existing.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-            [wrap addSubview:existing];
-        }
-        SMDockEntry *entry = [[SMDockEntry alloc] initWithFrame:CGRectMake(16, existingH + 16, width - 32, 62)];
+    SMDockEntry *entry = (SMDockEntry *)[scroll viewWithTag:kEntryTag];
+    if (!entry) {
+        entry = [[SMDockEntry alloc] initWithFrame:CGRectZero];
+        entry.tag = kEntryTag;
         entry.owner = vc;
-        entry.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-        [wrap addSubview:entry];
-        table.tableFooterView = wrap;
+        [scroll addSubview:entry];
     }
+    entry.backgroundColor = cardColorFromScroll(scroll);
+    entry.layer.zPosition = 50;
+
+    CGFloat width = scroll.bounds.size.width;
+    CGFloat side = 16;
+    CGFloat height = 52;
+    CGFloat y = scroll.contentSize.height + 14;
+    entry.frame = CGRectMake(side, y, width - side * 2, height);
+
+    CGFloat extra = height + 36;
+    NSNumber *base = objc_getAssociatedObject(scroll, "sm_baseBottom");
+    if (!base) {
+        base = @(scroll.contentInset.bottom);
+        objc_setAssociatedObject(scroll, "sm_baseBottom", base, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    UIEdgeInsets inset = scroll.contentInset;
+    CGFloat target = base.doubleValue + extra;
+    if (fabs(inset.bottom - target) > 0.5) {
+        inset.bottom = target;
+        scroll.contentInset = inset;
+        scroll.verticalScrollIndicatorInsets = inset;
+    }
+    [scroll bringSubviewToFront:entry];
 
     g_inSettings = NO;
 }
