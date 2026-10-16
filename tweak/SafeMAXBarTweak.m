@@ -185,12 +185,13 @@ static UIImageView *largestIcon(UIView *item) {
     return best;
 }
 
-static void alignIcons(UIView *bar) {
+static void pinIconsToPill(UIView *bar) {
+    UIView *pill = [bar viewWithTag:kPillTag];
     BOOL labelsOn = showLabels();
     for (UIView *item in tabItems(bar)) {
         UIImageView *icon = largestIcon(item);
         if (!icon.superview) continue;
-        if (labelsOn) {
+        if (labelsOn || !pill) {
             NSValue *saved = objc_getAssociatedObject(icon, "sm_iconCenter");
             if (saved) {
                 icon.center = saved.CGPointValue;
@@ -201,9 +202,24 @@ static void alignIcons(UIView *bar) {
         if (!objc_getAssociatedObject(icon, "sm_iconCenter")) {
             objc_setAssociatedObject(icon, "sm_iconCenter", [NSValue valueWithCGPoint:icon.center], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
-        CGPoint mid = [item convertPoint:CGPointMake(CGRectGetMidX(item.bounds), CGRectGetMidY(item.bounds)) toView:icon.superview];
-        icon.center = mid;
+        CGPoint mid = [pill convertPoint:CGPointMake(CGRectGetMidX(pill.bounds), CGRectGetMidY(pill.bounds)) toView:icon.superview];
+        CGFloat slotX = [item convertPoint:CGPointMake(CGRectGetMidX(item.bounds), 0) toView:icon.superview].x;
+        icon.center = CGPointMake(slotX, mid.y);
     }
+}
+
+static void scheduleIconPin(UIView *bar) {
+    if (showLabels() || !floatingDock()) return;
+    NSTimeInterval now = CACurrentMediaTime();
+    NSNumber *last = objc_getAssociatedObject(bar, "sm_pinAt");
+    if (last && now - last.doubleValue < 0.3) return;
+    objc_setAssociatedObject(bar, "sm_pinAt", @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        pinIconsToPill(bar);
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        pinIconsToPill(bar);
+    });
 }
 
 static void applyOrder(UIView *bar) {
@@ -360,7 +376,6 @@ static UIVisualEffect *makeGlass(void) {
 static void styleTabBar(UIView *bar) {
     if (!isBottomBar(bar)) return;
     applyLabels(bar);
-    alignIcons(bar);
     applyOrder(bar);
 
     BOOL floating = floatingDock();
@@ -386,11 +401,17 @@ static void styleTabBar(UIView *bar) {
     }
 
     CGRect glyphs = chromeBounds(bar);
-    if (CGRectIsNull(glyphs)) return;
     CGFloat side = 18;
-    CGFloat padY = 9;
-    CGFloat height = MAX(56, CGRectGetHeight(glyphs) + padY * 2);
-    CGFloat y = CGRectGetMidY(glyphs) - height / 2.0;
+    CGFloat height = 54;
+    CGFloat y = 4;
+    if (showLabels()) {
+        if (CGRectIsNull(glyphs)) return;
+        height = MAX(56, CGRectGetHeight(glyphs) + 18);
+        y = CGRectGetMidY(glyphs) - height / 2.0;
+    } else {
+        CGFloat band = bar.bounds.size.height > 70 ? 49 : bar.bounds.size.height;
+        y = MAX(2, (band - height) / 2.0);
+    }
     if (y < 2) y = 2;
     if (y + height > bar.bounds.size.height - 2) y = MAX(2, bar.bounds.size.height - 2 - height);
     CGRect frame = CGRectMake(side, y, bar.bounds.size.width - side * 2, height);
@@ -416,9 +437,9 @@ static void styleTabBar(UIView *bar) {
     pill.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:pill.bounds cornerRadius:height / 2.0].CGPath;
     UIVisualEffectView *glass = (UIVisualEffectView *)[pill viewWithTag:7];
     glass.frame = pill.bounds;
-    NSNumber *mode = @(liquidGlass());
-    if (![(NSNumber *)objc_getAssociatedObject(glass, "sm_mode") isEqualToNumber:mode]) {
-        objc_setAssociatedObject(glass, "sm_mode", mode, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    NSString *mode = [NSString stringWithFormat:@"%d-%ld", liquidGlass(), (long)bar.traitCollection.userInterfaceStyle];
+    if (![objc_getAssociatedObject(glass, "sm_mode") isEqual:mode]) {
+        objc_setAssociatedObject(glass, "sm_mode", mode, OBJC_ASSOCIATION_COPY_NONATOMIC);
         if (liquidGlass()) {
             glass.backgroundColor = [UIColor clearColor];
             glass.clipsToBounds = NO;
@@ -441,6 +462,8 @@ static void styleTabBar(UIView *bar) {
         glass.layer.cornerCurve = kCACornerCurveCircular;
     }
     [bar sendSubviewToBack:pill];
+    pinIconsToPill(bar);
+    scheduleIconPin(bar);
 }
 
 static UIView *locateBar(void) {
@@ -508,6 +531,11 @@ static void presentEditor(UIViewController *from);
 
 - (void)layoutSubviews {
     [super layoutSubviews];
+    UIColor *foreground = [UIColor labelColor];
+    self.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
+    ((UIImageView *)[self viewWithTag:1]).tintColor = foreground;
+    ((UILabel *)[self viewWithTag:2]).textColor = foreground;
+    ((UIImageView *)[self viewWithTag:4]).tintColor = [UIColor tertiaryLabelColor];
     [self viewWithTag:1].frame = CGRectMake(16, (self.bounds.size.height - 24) / 2.0, 24, 24);
     [self viewWithTag:4].frame = CGRectMake(self.bounds.size.width - 28, (self.bounds.size.height - 14) / 2.0, 12, 14);
     [self viewWithTag:2].frame = CGRectMake(56, 0, self.bounds.size.width - 96, self.bounds.size.height);
@@ -678,19 +706,6 @@ static UIScrollView *findMainScroll(UIView *view) {
     return best;
 }
 
-static UIColor *cardColorFromScroll(UIScrollView *scroll) {
-    if (@available(iOS 14.0, *)) {
-        if ([scroll isKindOfClass:[UICollectionView class]]) {
-            for (UICollectionViewCell *cell in ((UICollectionView *)scroll).visibleCells) {
-                UIColor *color = cell.backgroundConfiguration.backgroundColor;
-                if (color) return color;
-                if (cell.backgroundView.backgroundColor) return cell.backgroundView.backgroundColor;
-            }
-        }
-    }
-    return [UIColor colorWithWhite:0.15 alpha:1];
-}
-
 static void installSettingsEntry(UIViewController *vc) {
     if (g_inSettings || (SettingsClass && ![vc isKindOfClass:SettingsClass])) return;
     g_inSettings = YES;
@@ -708,7 +723,6 @@ static void installSettingsEntry(UIViewController *vc) {
         entry.owner = vc;
         [scroll addSubview:entry];
     }
-    entry.backgroundColor = cardColorFromScroll(scroll);
     entry.layer.zPosition = 50;
 
     CGFloat width = scroll.bounds.size.width;
@@ -738,6 +752,22 @@ static void installSettingsEntry(UIViewController *vc) {
 static BOOL isDockView(UIView *view) {
     if (TabBarClass) return [view isKindOfClass:TabBarClass];
     return isBottomBar(view);
+}
+
+static IMP orig_trait;
+
+static void swizzled_trait(id self, SEL _cmd, UITraitCollection *previous) {
+    ((void (*)(id, SEL, UITraitCollection *))orig_trait)(self, _cmd, previous);
+    if (![self isKindOfClass:[UIView class]]) return;
+    UIView *view = self;
+    if (!isDockView(view) && ![view isKindOfClass:[UIWindow class]]) return;
+    if (previous.userInterfaceStyle == view.traitCollection.userInterfaceStyle) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        styleAllBars();
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        styleAllBars();
+    });
 }
 
 static void swizzled_layout(id self, SEL _cmd) {
@@ -778,6 +808,10 @@ static void resolveAndHook(void) {
     Method appear = class_getInstanceMethod([UIViewController class], @selector(viewDidAppear:));
     orig_appear = method_getImplementation(appear);
     method_setImplementation(appear, (IMP)swizzled_appear);
+
+    Method trait = class_getInstanceMethod([UIView class], @selector(traitCollectionDidChange:));
+    orig_trait = method_getImplementation(trait);
+    method_setImplementation(trait, (IMP)swizzled_trait);
 }
 
 static IMP orig_infoDictionary;
