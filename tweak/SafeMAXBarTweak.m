@@ -9,9 +9,11 @@
 static NSString *const kShowLabelsKey = @"SafeMAX_ShowLabels";
 static NSString *const kFloatingKey = @"SafeMAX_FloatingDock";
 static NSString *const kOrderKey = @"SafeMAX_TabOrder";
+static NSString *const kGhostKey = @"SafeMAX_GhostMode";
 
 static const NSInteger kEntryTag = 0x5AF1;
 static const NSInteger kPillTag = 0x5AF3;
+static const NSInteger kGhostTag = 0x5AF5;
 
 static Class TabBarClass;
 static Class SettingsClass;
@@ -29,6 +31,11 @@ static BOOL showLabels(void) {
 static BOOL floatingDock(void) {
     id obj = [[NSUserDefaults standardUserDefaults] objectForKey:kFloatingKey];
     return obj ? [obj boolValue] : YES;
+}
+
+static BOOL ghostMode(void) {
+    id obj = [[NSUserDefaults standardUserDefaults] objectForKey:kGhostKey];
+    return obj ? [obj boolValue] : NO;
 }
 
 static NSArray<NSString *> *savedOrder(void) {
@@ -453,6 +460,7 @@ static void styleAllBars(void) {
 @end
 
 static void presentEditor(UIViewController *from);
+static void presentGhost(UIViewController *from);
 
 @implementation SMDockEntry
 
@@ -504,7 +512,8 @@ static void presentEditor(UIViewController *from);
 }
 
 - (void)open {
-    presentEditor(self.owner);
+    if (self.tag == kGhostTag) presentGhost(self.owner);
+    else presentEditor(self.owner);
 }
 
 @end
@@ -636,6 +645,70 @@ static void presentEditor(UIViewController *from) {
     [from presentViewController:nav animated:YES completion:nil];
 }
 
+@interface SMGhostEditor : UITableViewController
+@end
+
+@implementation SMGhostEditor
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"Невидимка";
+    self.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
+    self.tableView = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStyleInsetGrouped];
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(done)];
+}
+
+- (void)done {
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)switchChanged:(UISwitch *)sender {
+    [[NSUserDefaults standardUserDefaults] setBool:sender.on forKey:kGhostKey];
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 1; }
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section { return 1; }
+
+- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
+    return @"Приложение остаётся на связи, но другим вы не показываетесь в сети. Статус обновится после следующего пинга.";
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"g"];
+    if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"g"];
+    cell.backgroundColor = [UIColor colorWithWhite:0.14 alpha:1];
+    cell.textLabel.textColor = [UIColor whiteColor];
+    cell.textLabel.text = @"Скрыть онлайн";
+    cell.selectionStyle = UITableViewCellSelectionStyleNone;
+    UISwitch *toggle = [cell.contentView viewWithTag:9];
+    if (!toggle) {
+        toggle = [[UISwitch alloc] init];
+        toggle.tag = 9;
+        toggle.translatesAutoresizingMaskIntoConstraints = NO;
+        [toggle addTarget:self action:@selector(switchChanged:) forControlEvents:UIControlEventValueChanged];
+        [cell.contentView addSubview:toggle];
+        [NSLayoutConstraint activateConstraints:@[
+            [toggle.centerYAnchor constraintEqualToAnchor:cell.contentView.centerYAnchor],
+            [toggle.trailingAnchor constraintEqualToAnchor:cell.contentView.trailingAnchor constant:-8]
+        ]];
+    }
+    toggle.on = ghostMode();
+    return cell;
+}
+
+@end
+
+static void presentGhost(UIViewController *from) {
+    if (!from) from = topController();
+    if (!from) return;
+    SMGhostEditor *editor = [[SMGhostEditor alloc] init];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:editor];
+    nav.modalPresentationStyle = UIModalPresentationPageSheet;
+    nav.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
+    [from presentViewController:nav animated:YES completion:nil];
+}
+
 static UIScrollView *findMainScroll(UIView *view) {
     UIScrollView *best = nil;
     CGFloat bestHeight = 0;
@@ -672,13 +745,25 @@ static void installSettingsEntry(UIViewController *vc) {
     }
     entry.layer.zPosition = 50;
 
+    SMDockEntry *ghost = (SMDockEntry *)[scroll viewWithTag:kGhostTag];
+    if (!ghost) {
+        ghost = [[SMDockEntry alloc] initWithFrame:CGRectZero];
+        ghost.tag = kGhostTag;
+        ghost.owner = vc;
+        ((UILabel *)[ghost viewWithTag:2]).text = @"Невидимка";
+        ((UIImageView *)[ghost viewWithTag:1]).image = [UIImage systemImageNamed:@"eye.slash"];
+        [scroll addSubview:ghost];
+    }
+    ghost.layer.zPosition = 50;
+
     CGFloat width = scroll.bounds.size.width;
     CGFloat side = 16;
     CGFloat height = 52;
     CGFloat y = scroll.contentSize.height + 14;
     entry.frame = CGRectMake(side, y, width - side * 2, height);
+    ghost.frame = CGRectMake(side, CGRectGetMaxY(entry.frame) + 10, width - side * 2, height);
 
-    CGFloat extra = height + 36;
+    CGFloat extra = height * 2 + 46;
     NSNumber *base = objc_getAssociatedObject(scroll, "sm_baseBottom");
     if (!base) {
         base = @(scroll.contentInset.bottom);
@@ -692,6 +777,7 @@ static void installSettingsEntry(UIViewController *vc) {
         scroll.verticalScrollIndicatorInsets = inset;
     }
     [scroll bringSubviewToFront:entry];
+    [scroll bringSubviewToFront:ghost];
 
     g_inSettings = NO;
 }
@@ -730,11 +816,35 @@ static void scheduleRestyle(void) {
     });
 }
 
+static IMP orig_interactive;
+
+static BOOL swizzled_interactive(id self, SEL _cmd) {
+    if (ghostMode()) return NO;
+    return ((BOOL (*)(id, SEL))orig_interactive)(self, _cmd);
+}
+
+static void hookGhost(void) {
+    static BOOL hooked;
+    if (hooked) return;
+    Class cls = objc_getClass("OKMMessengerClient");
+    if (!cls) return;
+    SEL sel = @selector(interactive);
+    Method method = class_getInstanceMethod(cls, sel);
+    if (!method) return;
+    hooked = YES;
+    orig_interactive = method_getImplementation(method);
+    const char *types = method_getTypeEncoding(method);
+    if (!class_addMethod(cls, sel, (IMP)swizzled_interactive, types)) {
+        method_setImplementation(class_getInstanceMethod(cls, sel), (IMP)swizzled_interactive);
+    }
+}
+
 static void resolveAndHook(void) {
     static BOOL hooked;
     TabBarClass = objc_getClass("_TtC7OMUIKit6TabBar");
     SettingsClass = objc_getClass("_TtC10SettingsUI22SettingsViewController");
     styleAllBars();
+    hookGhost();
     if (hooked) return;
     hooked = YES;
 
@@ -766,6 +876,7 @@ static void hookLiquidGlassFlag(void);
 __attribute__((constructor))
 static void safeMAXDockInit(void) {
     hookLiquidGlassFlag();
+    hookGhost();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         resolveAndHook();
     });
