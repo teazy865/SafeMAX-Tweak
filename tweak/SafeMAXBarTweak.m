@@ -2,6 +2,8 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <string.h>
+#import <dlfcn.h>
+#import <limits.h>
 #import <QuartzCore/QuartzCore.h>
 
 // SafeMAX bottom dock is OMUIKit.TabBar, not UITabBar.
@@ -731,7 +733,7 @@ static void presentEditor(UIViewController *from) {
             break;
         case 2:
             cell.textLabel.text = @"Удалённые сообщения";
-            cell.detailTextLabel.text = @"Текст остаётся, тускнеет и помечается ❌";
+            cell.detailTextLabel.text = @"Остаются после перезапуска, тускнеют и помечаются ❌";
             on = keepDeleted();
             break;
         default:
@@ -949,6 +951,9 @@ static void sm_rememberDeletedText(NSString *text);
 static NSString *sm_messageBody(id message);
 static void sm_refreshDeletedLooks(void);
 static void sm_updateDeletedCell(UIView *cell);
+static NSDictionary *sm_snapshot(id message);
+static void sm_rememberSnapshot(NSDictionary *snap);
+static void sm_noteHistoryPage(id value);
 
 static id swizzled_deleteLocal(id self, SEL _cmd, id messageIds, id chat) {
     if (keepDeleted()) {
@@ -960,7 +965,9 @@ static id swizzled_deleteLocal(id self, SEL _cmd, id messageIds, id chat) {
 
 static void swizzled_setStatus(id self, SEL _cmd, NSUInteger status) {
     if (keepDeleted() && status == 2 && smMessageClass && [self isKindOfClass:smMessageClass]) {
-        sm_rememberDeletedText(sm_messageBody(self));
+        NSDictionary *snap = sm_snapshot(self);
+        if (snap) sm_rememberSnapshot(snap);
+        else sm_rememberDeletedText(sm_messageBody(self));
         sm_refreshDeletedLooks();
         return;
     }
@@ -993,22 +1000,101 @@ static void swizzled_delayedDeleted(id self, SEL _cmd, id notification) {
 
 static void swizzled_sendNextSubject(id self, SEL _cmd, id value) {
     if (keepDeleted() && sm_isRemovalEvent(value)) return;
+    if (keepDeleted()) sm_noteHistoryPage(value);
     ((void (*)(id, SEL, id))orig_sendNextSubject)(self, _cmd, value);
 }
 
 static void swizzled_sendNextReplay(id self, SEL _cmd, id value) {
     if (keepDeleted() && sm_isRemovalEvent(value)) return;
+    if (keepDeleted()) sm_noteHistoryPage(value);
     ((void (*)(id, SEL, id))orig_sendNextReplay)(self, _cmd, value);
 }
 
 static void swizzled_sendNextBehavior(id self, SEL _cmd, id value) {
     if (keepDeleted() && sm_isRemovalEvent(value)) return;
+    if (keepDeleted()) sm_noteHistoryPage(value);
     ((void (*)(id, SEL, id))orig_sendNextBehavior)(self, _cmd, value);
 }
 
 static void swizzled_sendNextPass(id self, SEL _cmd, id value) {
     if (keepDeleted() && sm_isRemovalEvent(value)) return;
+    if (keepDeleted()) sm_noteHistoryPage(value);
     ((void (*)(id, SEL, id))orig_sendNextPass)(self, _cmd, value);
+}
+
+static IMP orig_removeObject;
+static IMP orig_removeObjects;
+static IMP orig_setDbObject;
+static IMP orig_setMessages;
+static IMP orig_getMessages;
+static BOOL g_inMerge;
+static char smMergedSourceKey;
+static char smMergedValueKey;
+
+static BOOL sm_isMessagesCollection(id collection) {
+    return [collection isKindOfClass:[NSString class]] && [(NSString *)collection isEqualToString:@"messages"];
+}
+
+static BOOL sm_isKeptKey(id key);
+
+static void swizzled_removeObject(id self, SEL _cmd, id key, id collection) {
+    if (keepDeleted() && sm_isMessagesCollection(collection) && sm_isKeptKey(key)) return;
+    ((void (*)(id, SEL, id, id))orig_removeObject)(self, _cmd, key, collection);
+}
+
+static void swizzled_removeObjects(id self, SEL _cmd, id keys, id collection) {
+    if (keepDeleted() && sm_isMessagesCollection(collection) && [keys respondsToSelector:@selector(countByEnumeratingWithState:objects:count:)]) {
+        NSMutableArray *rest = [NSMutableArray array];
+        for (id key in keys) {
+            if (!sm_isKeptKey(key)) [rest addObject:key];
+        }
+        if (rest.count == 0) return;
+        keys = rest;
+    }
+    ((void (*)(id, SEL, id, id))orig_removeObjects)(self, _cmd, keys, collection);
+}
+
+static void swizzled_setDbObject(id self, SEL _cmd, id object, id key, id collection) {
+    if (keepDeleted() && sm_isMessagesCollection(collection) && sm_isKeptKey(key)) {
+        if (!object) return;
+        if (orig_status && smMessageClass && [object isKindOfClass:smMessageClass]) {
+            NSUInteger raw = ((NSUInteger (*)(id, SEL))orig_status)(object, @selector(status));
+            if (raw == 2) return;
+        }
+    }
+    ((void (*)(id, SEL, id, id, id))orig_setDbObject)(self, _cmd, object, key, collection);
+}
+
+static id sm_mergeKeptInto(id page, id messages);
+
+static id swizzled_getMessages(id self, SEL _cmd) {
+    id messages = ((id (*)(id, SEL))orig_getMessages)(self, _cmd);
+    if (!keepDeleted() || g_inMerge) return messages;
+    id cachedSource = objc_getAssociatedObject(self, &smMergedSourceKey);
+    id cachedMerged = objc_getAssociatedObject(self, &smMergedValueKey);
+    if (cachedSource == messages && cachedMerged) return cachedMerged;
+    g_inMerge = YES;
+    id merged = sm_mergeKeptInto(self, messages);
+    g_inMerge = NO;
+    if (!merged) merged = messages;
+    objc_setAssociatedObject(self, &smMergedSourceKey, messages, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(self, &smMergedValueKey, merged, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return merged;
+}
+
+static void swizzled_setMessages(id self, SEL _cmd, id messages) {
+    if (keepDeleted() && !g_inMerge) {
+        const char *name = class_getName(object_getClass(self));
+        if (name && strstr(name, "HistoryPage")) {
+            g_inMerge = YES;
+            id merged = sm_mergeKeptInto(self, messages);
+            g_inMerge = NO;
+            if (merged) messages = merged;
+            objc_setAssociatedObject(self, &smMergedSourceKey, nil, OBJC_ASSOCIATION_ASSIGN);
+            objc_setAssociatedObject(self, &smMergedValueKey, nil, OBJC_ASSOCIATION_ASSIGN);
+        }
+    }
+    ((void (*)(id, SEL, id))orig_setMessages)(self, _cmd, messages);
 }
 
 static void hookKeepDeleted(void) {
@@ -1023,6 +1109,13 @@ static void hookKeepDeleted(void) {
     sm_hook_own(objc_getClass("RACReplaySubject"), "sendNext:", (IMP)swizzled_sendNextReplay, &orig_sendNextReplay);
     sm_hook_own(objc_getClass("RACBehaviorSubject"), "sendNext:", (IMP)swizzled_sendNextBehavior, &orig_sendNextBehavior);
     sm_hook_own(objc_getClass("RACPassthroughSubscriber"), "sendNext:", (IMP)swizzled_sendNextPass, &orig_sendNextPass);
+    Class writeTx = objc_getClass("YapDatabaseReadWriteTransaction");
+    sm_hook_own(writeTx, "removeObjectForKey:inCollection:", (IMP)swizzled_removeObject, &orig_removeObject);
+    sm_hook_own(writeTx, "removeObjectsForKeys:inCollection:", (IMP)swizzled_removeObjects, &orig_removeObjects);
+    sm_hook_own(writeTx, "setObject:forKey:inCollection:", (IMP)swizzled_setDbObject, &orig_setDbObject);
+    Class pageClass = objc_getClass("OKMHistoryPage");
+    sm_hook_own(pageClass, "setMessages:", (IMP)swizzled_setMessages, &orig_setMessages);
+    sm_hook_own(pageClass, "messages", (IMP)swizzled_getMessages, &orig_getMessages);
 }
 
 static Ivar sm_textIvar(id text, NSString **value) {
@@ -1063,14 +1156,33 @@ static Ivar sm_textIvar(id text, NSString **value) {
 
 static const NSInteger kDeletedBadgeTag = 0x5AFD;
 static NSMutableOrderedSet<NSString *> *smDeletedBodies;
+static NSMutableArray *smKept;
+static NSMutableSet<NSString *> *smKeptKeys;
 static NSLock *smDeletedLock;
+static NSArray *g_lookupIds;
+static id g_lookupChat;
+static NSMutableArray *g_lookupSnaps;
 
 static void sm_loadDeletedBodies(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         smDeletedLock = [[NSLock alloc] init];
-        NSArray *saved = [[NSUserDefaults standardUserDefaults] arrayForKey:@"SafeMAX_DeletedBodies"];
+        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+        NSArray *saved = [defaults arrayForKey:@"SafeMAX_DeletedBodies"];
         smDeletedBodies = saved ? [NSMutableOrderedSet orderedSetWithArray:saved] : [NSMutableOrderedSet orderedSet];
+        NSArray *kept = [defaults arrayForKey:@"SafeMAX_KeptMessages"];
+        smKept = kept ? [kept mutableCopy] : [NSMutableArray array];
+        smKeptKeys = [NSMutableSet set];
+        for (NSDictionary *rec in smKept) {
+            if (![rec isKindOfClass:[NSDictionary class]]) continue;
+            id pk = rec[@"pk"];
+            id sid = rec[@"sid"];
+            if ([pk isKindOfClass:[NSString class]] && [pk length]) [smKeptKeys addObject:pk];
+            if ([sid respondsToSelector:@selector(stringValue)]) {
+                NSString *text = [sid stringValue];
+                if (text.length) [smKeptKeys addObject:text];
+            }
+        }
     });
 }
 
@@ -1081,8 +1193,34 @@ static BOOL sm_isDeletedBody(NSString *text) {
     sm_loadDeletedBodies();
     [smDeletedLock lock];
     BOOL hit = [smDeletedBodies containsObject:trimmed];
+    if (!hit && trimmed.length > 2) {
+        for (NSString *body in smDeletedBodies) {
+            if (body.length >= 2 && [trimmed rangeOfString:body].location != NSNotFound && trimmed.length <= body.length + 16) {
+                hit = YES;
+                break;
+            }
+        }
+    }
     [smDeletedLock unlock];
     return hit;
+}
+
+static BOOL sm_isKeptKey(id key) {
+    if (!key) return NO;
+    NSString *text = [key isKindOfClass:[NSString class]] ? key : ([key respondsToSelector:@selector(stringValue)] ? [key stringValue] : nil);
+    if (text.length == 0) return NO;
+    sm_loadDeletedBodies();
+    [smDeletedLock lock];
+    BOOL hit = [smKeptKeys containsObject:text];
+    [smDeletedLock unlock];
+    return hit;
+}
+
+static BOOL sm_isKeptServerId(id value) {
+    if (![value respondsToSelector:@selector(longLongValue)]) return NO;
+    long long number = ((long long (*)(id, SEL))objc_msgSend)(value, @selector(longLongValue));
+    if (number < 10000) return NO;
+    return sm_isKeptKey([@(number) stringValue]);
 }
 
 static void sm_rememberDeletedText(NSString *text) {
@@ -1103,25 +1241,166 @@ static void sm_rememberDeletedText(NSString *text) {
     if (snapshot) [[NSUserDefaults standardUserDefaults] setObject:snapshot forKey:@"SafeMAX_DeletedBodies"];
 }
 
-static NSString *sm_messageBody(id message) {
-    if (!message || [message isKindOfClass:[NSNumber class]]) return nil;
-    if ([message isKindOfClass:[NSString class]]) return message;
-    NSString *text = nil;
-    if ([message respondsToSelector:@selector(messageText)]) {
-        id messageText = ((id (*)(id, SEL))objc_msgSend)(message, @selector(messageText));
-        sm_textIvar(messageText, &text);
-        if (text.length) return text;
-        if ([messageText isKindOfClass:[NSString class]] && [messageText length]) return messageText;
-    }
-    if ([message respondsToSelector:@selector(shownMessageText)]) {
-        id shown = ((id (*)(id, SEL))objc_msgSend)(message, @selector(shownMessageText));
-        if ([shown isKindOfClass:[NSString class]] && [shown length]) return shown;
-    }
-    if ([message respondsToSelector:@selector(messageBody)]) {
-        id body = ((id (*)(id, SEL))objc_msgSend)(message, @selector(messageBody));
-        if ([body isKindOfClass:[NSString class]] && [body length]) return body;
+static id sm_call(id obj, const char *selName) {
+    SEL sel = sel_registerName(selName);
+    if (!obj || ![obj respondsToSelector:sel]) return nil;
+    return ((id (*)(id, SEL))objc_msgSend)(obj, sel);
+}
+
+static long long sm_callLL(id obj, const char *selName) {
+    SEL sel = sel_registerName(selName);
+    if (!obj || ![obj respondsToSelector:sel]) return 0;
+    return ((long long (*)(id, SEL))objc_msgSend)(obj, sel);
+}
+
+static id sm_plistId(id value) {
+    if (!value || value == (id)kCFNull) return nil;
+    if ([value isKindOfClass:[NSString class]] || [value isKindOfClass:[NSNumber class]]) return value;
+    if ([value respondsToSelector:@selector(longLongValue)]) {
+        return @(((long long (*)(id, SEL))objc_msgSend)(value, @selector(longLongValue)));
     }
     return nil;
+}
+
+static NSDictionary *sm_snapshot(id message) {
+    if (!message || [message isKindOfClass:[NSNumber class]] || [message isKindOfClass:[NSString class]]) return nil;
+    if (![message respondsToSelector:@selector(primaryKey)] && ![message respondsToSelector:@selector(messageText)]) return nil;
+    NSMutableDictionary *record = [NSMutableDictionary dictionary];
+    id pk = sm_plistId(sm_call(message, "primaryKey"));
+    id sid = sm_plistId(sm_call(message, "serverId"));
+    id cid = sm_plistId(sm_call(message, "chatId"));
+    id cpk = sm_plistId(sm_call(message, "chatPrimaryKey"));
+    id sender = sm_plistId(sm_call(message, "senderId"));
+    long long ts = sm_callLL(message, "timestampAsInt");
+    NSString *text = sm_messageBody(message);
+    if ([pk isKindOfClass:[NSString class]] && [(NSString *)pk length]) record[@"pk"] = pk;
+    else if ([pk isKindOfClass:[NSNumber class]]) record[@"pk"] = [pk stringValue];
+    if (sid) record[@"sid"] = [sid isKindOfClass:[NSNumber class]] ? sid : @([sid longLongValue]);
+    if ([cid isKindOfClass:[NSNumber class]] || [cid isKindOfClass:[NSString class]]) record[@"cid"] = cid;
+    if ([cpk isKindOfClass:[NSString class]] && [(NSString *)cpk length]) record[@"cpk"] = cpk;
+    if (sender) record[@"sender"] = [sender isKindOfClass:[NSNumber class]] ? sender : @([sender longLongValue]);
+    if (ts) record[@"ts"] = @(ts);
+    if (text.length) record[@"text"] = text;
+    if ([message respondsToSelector:@selector(my)]) {
+        BOOL mine = ((BOOL (*)(id, SEL))objc_msgSend)(message, @selector(my));
+        record[@"my"] = @(mine);
+    }
+    return record.count ? record : nil;
+}
+
+static void sm_rememberSnapshot(NSDictionary *snap) {
+    if (![snap isKindOfClass:[NSDictionary class]]) return;
+    NSMutableDictionary *clean = [NSMutableDictionary dictionary];
+    for (id key in snap) {
+        id value = snap[key];
+        if ([value isKindOfClass:[NSString class]] || [value isKindOfClass:[NSNumber class]]) clean[key] = value;
+    }
+    NSString *text = [clean[@"text"] isKindOfClass:[NSString class]] ? clean[@"text"] : nil;
+    if (text.length) sm_rememberDeletedText(text);
+    NSString *pk = [clean[@"pk"] isKindOfClass:[NSString class]] ? clean[@"pk"] : nil;
+    id sid = clean[@"sid"];
+    if (!pk.length && !sid && !text.length) return;
+    sm_loadDeletedBodies();
+    [smDeletedLock lock];
+    NSInteger found = NSNotFound;
+    long long sidValue = [sid respondsToSelector:@selector(longLongValue)] ? [sid longLongValue] : 0;
+    for (NSUInteger i = 0; i < smKept.count; i++) {
+        NSDictionary *old = smKept[i];
+        if (pk.length && [old[@"pk"] isEqual:pk]) { found = (NSInteger)i; break; }
+        if (sidValue && [old[@"sid"] longLongValue] == sidValue) { found = (NSInteger)i; break; }
+    }
+    if (found != NSNotFound) [smKept replaceObjectAtIndex:(NSUInteger)found withObject:clean];
+    else [smKept addObject:clean];
+    while (smKept.count > 200) [smKept removeObjectAtIndex:0];
+    [smKeptKeys removeAllObjects];
+    for (NSDictionary *rec in smKept) {
+        id recPk = rec[@"pk"];
+        id recSid = rec[@"sid"];
+        if ([recPk isKindOfClass:[NSString class]] && [recPk length]) [smKeptKeys addObject:recPk];
+        if ([recSid respondsToSelector:@selector(stringValue)]) {
+            NSString *sidText = [recSid stringValue];
+            if (sidText.length) [smKeptKeys addObject:sidText];
+        }
+    }
+    NSArray *stored = [smKept copy];
+    [smDeletedLock unlock];
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    [defaults setObject:stored forKey:@"SafeMAX_KeptMessages"];
+    [defaults synchronize];
+}
+
+typedef struct {
+    void *isa;
+    int flags;
+    int reserved;
+    void *invoke;
+    void *descriptor;
+} SMBlockLiteral;
+
+static void sm_lookup_invoke(void *block, id transaction) {
+    (void)block;
+    SEL inChat = sel_registerName("okm_messageForId:inChat:");
+    SEL includeRemoved = sel_registerName("okm_messageForId:inChat:includeRemoved:");
+    SEL byChatId = sel_registerName("okm_messageForId:chatId:");
+    SEL byPk = sel_registerName("okm_messageForPk:");
+    id chatId = sm_call(g_lookupChat, "chatId");
+    for (id item in g_lookupIds) {
+        @try {
+            id message = nil;
+            if (smMessageClass && [item isKindOfClass:smMessageClass]) message = item;
+            if (!message && [transaction respondsToSelector:inChat]) {
+                message = ((id (*)(id, SEL, id, id))objc_msgSend)(transaction, inChat, item, g_lookupChat);
+            }
+            if (!message && [transaction respondsToSelector:includeRemoved]) {
+                message = ((id (*)(id, SEL, id, id, BOOL))objc_msgSend)(transaction, includeRemoved, item, g_lookupChat, YES);
+            }
+            if (!message && chatId && [transaction respondsToSelector:byChatId]) {
+                message = ((id (*)(id, SEL, id, id))objc_msgSend)(transaction, byChatId, item, chatId);
+            }
+            if (!message && [item isKindOfClass:[NSString class]] && [transaction respondsToSelector:byPk]) {
+                message = ((id (*)(id, SEL, id))objc_msgSend)(transaction, byPk, item);
+            }
+            NSDictionary *snap = sm_snapshot(message);
+            if (snap) [g_lookupSnaps addObject:snap];
+            else {
+                NSString *body = sm_messageBody(item);
+                if (body.length) [g_lookupSnaps addObject:@{@"text": body}];
+            }
+        } @catch (__unused NSException *exception) {
+        }
+    }
+}
+
+static id sm_readBlock(void) {
+    static SMBlockLiteral block;
+    static struct { unsigned long reserved; unsigned long size; const char *signature; const char *layout; } desc;
+    static dispatch_once_t once;
+    static BOOL ready;
+    dispatch_once(&once, ^{
+        void *isa = dlsym(RTLD_DEFAULT, "_NSConcreteGlobalBlock");
+        if (!isa) return;
+        desc.size = sizeof(block);
+        desc.signature = "v16@?0@8";
+        desc.layout = "\0";
+        block.isa = isa;
+        block.flags = (1 << 28) | (1 << 30);
+        block.invoke = (void *)sm_lookup_invoke;
+        block.descriptor = &desc;
+        ready = YES;
+    });
+    return ready ? (__bridge id)&block : nil;
+}
+
+static id sm_readConnection(id serviceOwner) {
+    id conn = sm_call(serviceOwner, "dbConnection");
+    if (!conn) conn = sm_call(serviceOwner, "readConnection");
+    if (!conn) {
+        id service = sm_call(serviceOwner, "chatService");
+        conn = sm_call(service, "readConnection");
+        if (!conn) conn = sm_call(service, "dbConnection");
+        if (!conn) conn = sm_call(service, "writeConnection");
+    }
+    return conn;
 }
 
 static void sm_noteDeletedPayload(id ids, id chat, id serviceOwner) {
@@ -1131,25 +1410,250 @@ static void sm_noteDeletedPayload(id ids, id chat, id serviceOwner) {
     } else if (ids) {
         [items addObject:ids];
     }
-    id service = serviceOwner;
-    if (service && ![service respondsToSelector:@selector(messageWithId:chatId:)] && [service respondsToSelector:@selector(chatService)]) {
-        service = ((id (*)(id, SEL))objc_msgSend)(service, @selector(chatService));
-    }
-    id chatId = [chat respondsToSelector:@selector(chatId)] ? ((id (*)(id, SEL))objc_msgSend)(chat, @selector(chatId)) : nil;
-    for (id item in items) {
-        NSString *body = sm_messageBody(item);
-        if (!body.length && service && chatId && [service respondsToSelector:@selector(messageWithId:chatId:)]) {
-            id message = nil;
-            @try {
-                message = ((id (*)(id, SEL, id, id))objc_msgSend)(service, @selector(messageWithId:chatId:), item, chatId);
-            } @catch (__unused NSException *exception) {
-                message = nil;
-            }
-            body = sm_messageBody(message);
+    if (items.count == 0) return;
+    g_lookupIds = items;
+    g_lookupChat = chat;
+    g_lookupSnaps = [NSMutableArray array];
+    id connection = sm_readConnection(serviceOwner);
+    id block = sm_readBlock();
+    BOOL ran = NO;
+    if (connection && block && [connection respondsToSelector:@selector(readWithBlock:)]) {
+        @try {
+            ((void (*)(id, SEL, id))objc_msgSend)(connection, @selector(readWithBlock:), block);
+            ran = YES;
+        } @catch (__unused NSException *exception) {
+            ran = NO;
         }
-        if (body.length) sm_rememberDeletedText(body);
     }
-    if (items.count) sm_refreshDeletedLooks();
+    if (!ran) {
+        for (id item in items) {
+            NSDictionary *snap = sm_snapshot(item);
+            if (snap) [g_lookupSnaps addObject:snap];
+            else {
+                NSString *body = sm_messageBody(item);
+                if (body.length) [g_lookupSnaps addObject:@{@"text": body}];
+            }
+        }
+    }
+    NSArray *snaps = [g_lookupSnaps copy];
+    id chatRef = chat;
+    g_lookupIds = nil;
+    g_lookupChat = nil;
+    g_lookupSnaps = nil;
+    for (NSDictionary *snap in snaps) {
+        if (![snap isKindOfClass:[NSDictionary class]]) continue;
+        NSMutableDictionary *rich = [snap mutableCopy];
+        id cid = rich[@"cid"];
+        if (![cid respondsToSelector:@selector(longLongValue)] || [cid longLongValue] == 0) {
+            id found = sm_plistId(sm_call(chatRef, "chatId"));
+            if (found) rich[@"cid"] = found;
+        }
+        if (![rich[@"cpk"] isKindOfClass:[NSString class]]) {
+            id cpk = sm_call(chatRef, "primaryKey");
+            if ([cpk isKindOfClass:[NSString class]] && [(NSString *)cpk length]) rich[@"cpk"] = cpk;
+        }
+        sm_rememberSnapshot(rich);
+    }
+    if (snaps.count) sm_refreshDeletedLooks();
+}
+
+static BOOL sm_sameChat(NSDictionary *rec, id sample) {
+    id cpk = sm_call(sample, "chatPrimaryKey");
+    if ([cpk isKindOfClass:[NSString class]] && [rec[@"cpk"] isKindOfClass:[NSString class]] && [cpk isEqual:rec[@"cpk"]]) return YES;
+    id cid = sm_call(sample, "chatId");
+    if (rec[@"cid"] && cid && [cid respondsToSelector:@selector(longLongValue)]) {
+        long long left = [rec[@"cid"] longLongValue];
+        long long right = [cid longLongValue];
+        if (left && left == right) return YES;
+    }
+    return NO;
+}
+
+static NSString *sm_msgKey(id message) {
+    id pk = sm_call(message, "primaryKey");
+    if ([pk isKindOfClass:[NSString class]] && [pk length]) return pk;
+    id sid = sm_call(message, "serverId");
+    if ([sid respondsToSelector:@selector(longLongValue)]) {
+        long long value = [sid longLongValue];
+        if (value) return [NSString stringWithFormat:@"sid:%lld", value];
+    }
+    return nil;
+}
+
+static id sm_makeMessage(NSDictionary *rec) {
+    Class messageClass = objc_getClass("OKMMessage");
+    Class textClass = objc_getClass("OKMMessageText");
+    if (!messageClass) return nil;
+    NSString *pk = [rec[@"pk"] isKindOfClass:[NSString class]] ? rec[@"pk"] : nil;
+    id message = nil;
+    if (pk.length && [messageClass instancesRespondToSelector:@selector(initWithPrimaryKey:)]) {
+        id allocated = ((id (*)(id, SEL))objc_msgSend)(messageClass, @selector(alloc));
+        message = ((id (*)(id, SEL, id))objc_msgSend)(allocated, @selector(initWithPrimaryKey:), pk);
+    } else {
+        message = ((id (*)(id, SEL))objc_msgSend)(messageClass, @selector(new));
+    }
+    if (!message) return nil;
+    NSString *text = [rec[@"text"] isKindOfClass:[NSString class]] ? rec[@"text"] : nil;
+    if (text.length && textClass) {
+        NSString *visible = [text containsString:@"❌"] ? text : [@"❌ " stringByAppendingString:text];
+        id allocated = ((id (*)(id, SEL))objc_msgSend)(textClass, @selector(alloc));
+        id messageText = nil;
+        if ([textClass instancesRespondToSelector:@selector(initWithText:)]) {
+            messageText = ((id (*)(id, SEL, id))objc_msgSend)(allocated, @selector(initWithText:), visible);
+        } else if ([textClass instancesRespondToSelector:@selector(initWithText:elements:)]) {
+            messageText = ((id (*)(id, SEL, id, id))objc_msgSend)(allocated, @selector(initWithText:elements:), visible, nil);
+        }
+        if (messageText && [message respondsToSelector:@selector(setMessageText:)]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(message, @selector(setMessageText:), messageText);
+        }
+    }
+    if (rec[@"sid"] && [message respondsToSelector:@selector(setServerId:)]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(message, @selector(setServerId:), rec[@"sid"]);
+    }
+    if (rec[@"cid"] && [message respondsToSelector:@selector(setChatId:)]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(message, @selector(setChatId:), rec[@"cid"]);
+    }
+    if (rec[@"cpk"] && [message respondsToSelector:@selector(setChatPrimaryKey:)]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(message, @selector(setChatPrimaryKey:), rec[@"cpk"]);
+    }
+    if (rec[@"sender"] && [message respondsToSelector:@selector(setSenderId:)]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(message, @selector(setSenderId:), rec[@"sender"]);
+    }
+    long long ts = [rec[@"ts"] longLongValue];
+    if (ts && [message respondsToSelector:@selector(setTimestampAsInt:)]) {
+        ((void (*)(id, SEL, long long))objc_msgSend)(message, @selector(setTimestampAsInt:), ts);
+    }
+    if ([message respondsToSelector:@selector(setStatus:)]) {
+        ((void (*)(id, SEL, NSUInteger))objc_msgSend)(message, @selector(setStatus:), 0);
+    }
+    if (rec[@"my"] && [message respondsToSelector:@selector(setMy:)]) {
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(message, @selector(setMy:), [rec[@"my"] boolValue]);
+    }
+    return message;
+}
+
+static id sm_mergeKeptInto(id page, id messages) {
+    if (!keepDeleted()) return messages;
+    NSArray *current = [messages isKindOfClass:[NSArray class]] ? messages : nil;
+    if (current.count == 0) return messages;
+    sm_loadDeletedBodies();
+    [smDeletedLock lock];
+    NSArray *recs = [smKept copy];
+    [smDeletedLock unlock];
+    if (recs.count == 0) return messages;
+    id sample = current.firstObject;
+    long long minTs = LLONG_MAX;
+    long long maxTs = LLONG_MIN;
+    NSMutableSet *seen = [NSMutableSet set];
+    for (id message in current) {
+        NSString *key = sm_msgKey(message);
+        if (key) [seen addObject:key];
+        long long ts = sm_callLL(message, "timestampAsInt");
+        if (ts < minTs) minTs = ts;
+        if (ts > maxTs) maxTs = ts;
+    }
+    if ([page respondsToSelector:@selector(earliestMessageTimestamp)]) {
+        @try {
+            unsigned long long early = ((unsigned long long (*)(id, SEL))objc_msgSend)(page, @selector(earliestMessageTimestamp));
+            if (early && (minTs == LLONG_MAX || (long long)early < minTs)) minTs = (long long)early;
+        } @catch (__unused NSException *exception) {
+        }
+    }
+    if ([page respondsToSelector:@selector(latestMessageTimestamp)]) {
+        @try {
+            unsigned long long late = ((unsigned long long (*)(id, SEL))objc_msgSend)(page, @selector(latestMessageTimestamp));
+            if (late && (maxTs == LLONG_MIN || (long long)late > maxTs)) maxTs = (long long)late;
+        } @catch (__unused NSException *exception) {
+        }
+    }
+    BOOL lastPage = NO;
+    if ([page respondsToSelector:@selector(isLastPage)]) {
+        lastPage = ((BOOL (*)(id, SEL))objc_msgSend)(page, @selector(isLastPage));
+    }
+    NSMutableArray *extra = [NSMutableArray array];
+    for (NSDictionary *rec in recs) {
+        if (![rec isKindOfClass:[NSDictionary class]] || !sm_sameChat(rec, sample)) continue;
+        NSString *pk = [rec[@"pk"] isKindOfClass:[NSString class]] ? rec[@"pk"] : nil;
+        long long sid = [rec[@"sid"] longLongValue];
+        if (pk.length && [seen containsObject:pk]) continue;
+        if (sid && [seen containsObject:[NSString stringWithFormat:@"sid:%lld", sid]]) continue;
+        long long ts = [rec[@"ts"] longLongValue];
+        BOOL inRange = ts && minTs != LLONG_MAX && ts >= minTs && ts <= maxTs;
+        BOOL tail = lastPage && ts && (maxTs == LLONG_MIN || ts > maxTs);
+        if (!inRange && !tail) continue;
+        id made = sm_makeMessage(rec);
+        if (!made) continue;
+        [extra addObject:made];
+        if (pk.length) [seen addObject:pk];
+        if (sid) [seen addObject:[NSString stringWithFormat:@"sid:%lld", sid]];
+    }
+    if (extra.count == 0) return messages;
+    NSMutableArray *all = [current mutableCopy];
+    [all addObjectsFromArray:extra];
+    [all sortUsingComparator:^NSComparisonResult(id a, id b) {
+        long long left = sm_callLL(a, "timestampAsInt");
+        long long right = sm_callLL(b, "timestampAsInt");
+        if (left < right) return NSOrderedAscending;
+        if (left > right) return NSOrderedDescending;
+        return NSOrderedSame;
+    }];
+    return all;
+}
+
+static void sm_noteHistoryPage(id value) {
+    if (!keepDeleted() || !value || g_inMerge) return;
+    const char *name = class_getName(object_getClass(value));
+    if (!name || !strstr(name, "HistoryPage")) return;
+    if (![value respondsToSelector:@selector(messages)] || ![value respondsToSelector:@selector(setMessages:)]) return;
+    id current = ((id (*)(id, SEL))objc_msgSend)(value, @selector(messages));
+    g_inMerge = YES;
+    id merged = sm_mergeKeptInto(value, current);
+    g_inMerge = NO;
+    if (merged && merged != current) {
+        g_inMerge = YES;
+        ((void (*)(id, SEL, id))objc_msgSend)(value, @selector(setMessages:), merged);
+        g_inMerge = NO;
+    }
+}
+
+static NSString *sm_stringFromText(id value) {
+    if (!value || value == (id)kCFNull || [value isKindOfClass:[NSNumber class]]) return nil;
+    if ([value isKindOfClass:[NSString class]]) return [(NSString *)value length] ? value : nil;
+    if ([value isKindOfClass:[NSAttributedString class]]) {
+        NSString *string = ((NSAttributedString *)value).string;
+        return string.length ? string : nil;
+    }
+    NSString *text = nil;
+    sm_textIvar(value, &text);
+    if (text.length) return text;
+    if ([value respondsToSelector:@selector(text)]) {
+        id inner = ((id (*)(id, SEL))objc_msgSend)(value, @selector(text));
+        if ([inner isKindOfClass:[NSString class]] && [(NSString *)inner length]) return inner;
+    }
+    return nil;
+}
+
+static NSString *sm_messageBody(id message) {
+    if (!message || [message isKindOfClass:[NSNumber class]]) return nil;
+    NSString *direct = sm_stringFromText(message);
+    if (direct.length && [message isKindOfClass:[NSString class]]) return direct;
+    if ([message respondsToSelector:@selector(messageText)]) {
+        NSString *text = sm_stringFromText(((id (*)(id, SEL))objc_msgSend)(message, @selector(messageText)));
+        if (text.length) return text;
+    }
+    if ([message respondsToSelector:@selector(shownText)]) {
+        NSString *text = sm_stringFromText(((id (*)(id, SEL))objc_msgSend)(message, @selector(shownText)));
+        if (text.length) return text;
+    }
+    if ([message respondsToSelector:@selector(shownMessageText)]) {
+        NSString *text = sm_stringFromText(((id (*)(id, SEL))objc_msgSend)(message, @selector(shownMessageText)));
+        if (text.length) return text;
+    }
+    if ([message respondsToSelector:@selector(messageBody)]) {
+        NSString *text = sm_stringFromText(((id (*)(id, SEL))objc_msgSend)(message, @selector(messageBody)));
+        if (text.length) return text;
+    }
+    return direct;
 }
 
 static NSString *sm_viewText(UIView *view) {
@@ -1167,6 +1671,12 @@ static NSString *sm_viewText(UIView *view) {
         id text = ((id (*)(id, SEL))objc_msgSend)(view, @selector(text));
         if ([text isKindOfClass:[NSString class]] && [text length]) return text;
     }
+    const char *name = class_getName(object_getClass(view));
+    if (name && (strstr(name, "Text") || strstr(name, "Label") || strstr(name, "Message"))) {
+        NSString *ivarText = nil;
+        sm_textIvar(view, &ivarText);
+        if (ivarText.length) return ivarText;
+    }
     return nil;
 }
 
@@ -1175,6 +1685,16 @@ static BOOL sm_treeHasDeletedText(UIView *view) {
     if (view.tag != kDeletedBadgeTag && sm_isDeletedBody(view.accessibilityLabel)) return YES;
     for (UIView *subview in view.subviews) {
         if (sm_treeHasDeletedText(subview)) return YES;
+    }
+    return NO;
+}
+
+static BOOL sm_treeHasMark(UIView *view) {
+    NSString *text = sm_viewText(view);
+    if (text.length && [text rangeOfString:@"❌"].location != NSNotFound) return YES;
+    for (UIView *subview in view.subviews) {
+        if (subview.tag == kDeletedBadgeTag) continue;
+        if (sm_treeHasMark(subview)) return YES;
     }
     return NO;
 }
@@ -1223,6 +1743,11 @@ static void sm_updateDeletedCell(UIView *cell) {
         return;
     }
     if (bubble) bubble.alpha = 0.62;
+    if (sm_treeHasMark(cell)) {
+        if (badge) [badge removeFromSuperview];
+        busy = NO;
+        return;
+    }
     if (![badge isKindOfClass:[UILabel class]]) {
         badge = [[UILabel alloc] init];
         badge.tag = kDeletedBadgeTag;
