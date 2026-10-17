@@ -749,7 +749,7 @@ static void presentEditor(UIViewController *from) {
             break;
         case 2:
             cell.textLabel.text = @"Удалённые сообщения";
-            cell.detailTextLabel.text = @"Остаются после перезапуска и помечаются ❌";
+            cell.detailTextLabel.text = @"Остаются после перезапуска, на пузыре красная корзина";
             on = keepDeleted();
             break;
         case 3:
@@ -1435,7 +1435,25 @@ static BOOL sm_isKeptServerId(id value) {
     return sm_isKeptKey([@(number) stringValue]);
 }
 
+static NSString *sm_stripDeletedMark(NSString *text) {
+    if (![text isKindOfClass:[NSString class]] || text.length == 0) return text;
+    NSString *clean = text;
+    while (clean.length) {
+        if ([clean hasPrefix:@"❌ "]) {
+            clean = [clean substringFromIndex:2];
+            continue;
+        }
+        if ([clean hasPrefix:@"❌"]) {
+            clean = [clean substringFromIndex:1];
+            continue;
+        }
+        break;
+    }
+    return [clean isEqualToString:text] ? text : clean;
+}
+
 static void sm_rememberDeletedText(NSString *text) {
+    text = sm_stripDeletedMark(text);
     if (text.length == 0) return;
     sm_loadDeletedBodies();
     NSArray<NSString *> *parts = [text componentsSeparatedByString:@"\n—— было ——\n"];
@@ -1641,12 +1659,12 @@ static void sm_prefixDeletedMark(id message) {
     NSString *text = nil;
     Ivar ivar = sm_textIvar(messageText, &text);
     if (text.length == 0) text = sm_messageBody(message);
-    if (text.length == 0 || [text rangeOfString:@"❌"].location != NSNotFound) return;
-    NSString *marked = [@"❌ " stringByAppendingString:text];
+    NSString *clean = sm_stripDeletedMark(text);
+    if (clean.length == 0 || [clean isEqualToString:text]) return;
     if (messageText && [messageText respondsToSelector:@selector(setText:)]) {
-        ((void (*)(id, SEL, id))objc_msgSend)(messageText, @selector(setText:), marked);
+        ((void (*)(id, SEL, id))objc_msgSend)(messageText, @selector(setText:), clean);
     } else if (ivar && messageText) {
-        object_setIvar(messageText, ivar, marked);
+        object_setIvar(messageText, ivar, clean);
     }
 }
 
@@ -1793,7 +1811,7 @@ static id sm_makeMessage(NSDictionary *rec) {
     if (!message) return nil;
     NSString *text = [rec[@"text"] isKindOfClass:[NSString class]] ? rec[@"text"] : nil;
     if (text.length && textClass) {
-        NSString *visible = [text containsString:@"❌"] ? text : [@"❌ " stringByAppendingString:text];
+        NSString *visible = sm_stripDeletedMark(text);
         id allocated = ((id (*)(id, SEL))objc_msgSend)(textClass, @selector(alloc));
         id messageText = nil;
         if ([textClass instancesRespondToSelector:@selector(initWithText:)]) {
@@ -2101,9 +2119,33 @@ static BOOL sm_inHistoryList(UIView *view) {
     return NO;
 }
 
+static BOOL sm_isTopHistoryCell(UIView *view) {
+    BOOL candidate = sm_isHistoryMessageCell(view) || ([view isKindOfClass:[UICollectionViewCell class]] && sm_inHistoryList(view));
+    if (!candidate) return NO;
+    for (UIView *cursor = view.superview; cursor; cursor = cursor.superview) {
+        if (sm_isHistoryMessageCell(cursor)) return NO;
+        if ([cursor isKindOfClass:[UICollectionViewCell class]] && sm_inHistoryList(cursor)) return NO;
+    }
+    return YES;
+}
+
+static void sm_stripVisibleMark(UIView *view) {
+    if (view.tag == kDeletedBadgeTag) return;
+    NSString *text = nil;
+    if ([view isKindOfClass:[UILabel class]]) text = ((UILabel *)view).text;
+    else if ([view isKindOfClass:[UITextView class]]) text = ((UITextView *)view).text;
+    if (text.length && [text rangeOfString:@"❌"].location != NSNotFound) {
+        NSString *clean = sm_stripDeletedMark(text);
+        if (![clean isEqualToString:text]) {
+            if ([view isKindOfClass:[UILabel class]]) ((UILabel *)view).text = clean;
+            else ((UITextView *)view).text = clean;
+        }
+    }
+    for (UIView *subview in view.subviews) sm_stripVisibleMark(subview);
+}
+
 static void sm_updateDeletedCell(UIView *cell) {
-    BOOL historyCell = sm_isHistoryMessageCell(cell);
-    if (!historyCell && (![cell isKindOfClass:[UICollectionViewCell class]] || !sm_inHistoryList(cell))) return;
+    if (!sm_isTopHistoryCell(cell)) return;
     static char smTrashBusyKey;
     if (objc_getAssociatedObject(cell, &smTrashBusyKey)) return;
     objc_setAssociatedObject(cell, &smTrashBusyKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -2117,6 +2159,7 @@ static void sm_updateDeletedCell(UIView *cell) {
         return;
     }
     if (bubble && bubble.alpha < 0.99) bubble.alpha = 1;
+    sm_stripVisibleMark(cell);
     UIImageView *icon = [badge isKindOfClass:[UIImageView class]] ? (UIImageView *)badge : nil;
     if (!icon) {
         [badge removeFromSuperview];
@@ -2127,25 +2170,26 @@ static void sm_updateDeletedCell(UIView *cell) {
         UIImageSymbolConfiguration *config = [UIImageSymbolConfiguration configurationWithPointSize:11 weight:UIImageSymbolWeightSemibold];
         icon.image = [[UIImage systemImageNamed:@"trash" withConfiguration:config] imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
         icon.tintColor = [UIColor colorWithRed:1 green:0.23 blue:0.19 alpha:1];
-        UIView *host = bubble ?: cell;
-        [host addSubview:icon];
+        [cell addSubview:icon];
+    } else if (icon.superview != cell) {
+        [cell addSubview:icon];
     }
-    UIView *host = icon.superview ?: bubble ?: cell;
-    CGFloat side = 13;
-    CGRect frame = CGRectMake(host.bounds.size.width - side - 6, host.bounds.size.height - side - 5, side, side);
-    UILabel *time = sm_timeLabel(bubble ?: cell);
+    CGFloat side = 12;
+    CGRect bubbleFrame = bubble ? [bubble convertRect:bubble.bounds toView:cell] : cell.bounds;
+    CGFloat x = CGRectGetMaxX(bubbleFrame) + 2;
+    CGFloat y = CGRectGetMaxY(bubbleFrame) - side - 4;
+    UILabel *time = sm_timeLabel(cell);
     if (time) {
-        CGRect timeFrame = [time convertRect:time.bounds toView:host];
-        CGFloat x = CGRectGetMaxX(timeFrame) + 3;
-        CGFloat limit = host.bounds.size.width - side - 3;
-        if (x > limit) x = limit;
-        if (x < 2) x = 2;
-        CGFloat y = CGRectGetMidY(timeFrame) - side / 2.0;
-        if (y < 1) y = 1;
-        frame = CGRectMake(x, y, side, side);
+        CGRect timeFrame = [time convertRect:time.bounds toView:cell];
+        x = CGRectGetMaxX(timeFrame) + 6;
+        y = CGRectGetMidY(timeFrame) - side / 2.0;
     }
-    icon.frame = frame;
-    [host bringSubviewToFront:icon];
+    CGFloat maxX = cell.bounds.size.width - side - 1;
+    if (x > maxX) x = maxX;
+    if (x < 1) x = 1;
+    if (y < 1) y = 1;
+    icon.frame = CGRectMake(x, y, side, side);
+    [cell bringSubviewToFront:icon];
     objc_setAssociatedObject(cell, &smTrashBusyKey, nil, OBJC_ASSOCIATION_ASSIGN);
 }
 
