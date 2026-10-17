@@ -48,6 +48,40 @@ jobs:
           fi
           echo "Detected binary: $BINARY"
 
+      - name: Rename to Max and remove channel link
+        run: |
+          python3 - << 'PY'
+          import os, plistlib
+          from pathlib import Path
+          app = Path(os.environ["APP"])
+          def patch(path):
+              raw = path.read_bytes()
+              try:
+                  data = plistlib.loads(raw)
+              except Exception:
+                  return
+              if not isinstance(data, dict):
+                  return
+              changed = False
+              for key in ("CFBundleDisplayName", "CFBundleName"):
+                  if key in data and data[key] != "Max":
+                      data[key] = "Max"
+                      changed = True
+              title = data.get("ABOUT_SETTINGS_VERSION_TITLE")
+              if isinstance(title, str) and "t.me" in title:
+                  data["ABOUT_SETTINGS_VERSION_TITLE"] = title.split("|", 1)[0].strip()
+                  changed = True
+              if changed:
+                  fmt = plistlib.FMT_BINARY if raw.startswith(b"bplist") else plistlib.FMT_XML
+                  path.write_bytes(plistlib.dumps(data, fmt=fmt))
+                  print("patched", path)
+          patch(app / "Info.plist")
+          for path in app.rglob("InfoPlist.strings"):
+              patch(path)
+          for path in app.rglob("Localizable.strings"):
+              patch(path)
+          PY
+
       - name: Allow background location
         run: |
           /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes: string location" "$APP/Info.plist" || true
