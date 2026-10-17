@@ -2002,7 +2002,71 @@ static BOOL sm_treeHasMark(UIView *view) {
 
 static BOOL sm_isHistoryMessageCell(UIView *view) {
     const char *name = class_getName(object_getClass(view));
-    return name && (strstr(name, "11MessageCell") || strstr(name, "WidgetMessageCell"));
+    if (name && (strstr(name, "MessageCell") || strstr(name, "WidgetMessage"))) return YES;
+    return [view isKindOfClass:[UICollectionViewCell class]] && name && strstr(name, "Bubble");
+}
+
+static id sm_boundMessage(UIView *view) {
+    if (!view) return nil;
+    Class cls = object_getClass(view);
+    while (cls && cls != [UIView class] && cls != [NSObject class]) {
+        unsigned int count = 0;
+        Ivar *ivars = class_copyIvarList(cls, &count);
+        for (unsigned int i = 0; ivars && i < count; i++) {
+            const char *type = ivar_getTypeEncoding(ivars[i]);
+            if (!type || type[0] != '@') continue;
+            id value = nil;
+            @try {
+                value = object_getIvar(view, ivars[i]);
+            } @catch (__unused NSException *exception) {
+                value = nil;
+            }
+            if (smMessageClass && [value isKindOfClass:smMessageClass]) {
+                free(ivars);
+                return value;
+            }
+        }
+        free(ivars);
+        cls = class_getSuperclass(cls);
+    }
+    return nil;
+}
+
+static BOOL sm_looksLikeTime(NSString *text) {
+    if (text.length < 4 || text.length > 24) return NO;
+    if ([text rangeOfString:@"❌"].location != NSNotFound) return NO;
+    NSRange colon = [text rangeOfString:@":"];
+    return colon.location != NSNotFound && colon.location > 0;
+}
+
+static UILabel *sm_timeLabel(UIView *view) {
+    UILabel *found = nil;
+    if ([view isKindOfClass:[UILabel class]] && view.tag != kDeletedBadgeTag && sm_looksLikeTime(((UILabel *)view).text)) {
+        found = (UILabel *)view;
+    }
+    for (UIView *subview in view.subviews) {
+        if (subview.tag == kDeletedBadgeTag) continue;
+        UILabel *inner = sm_timeLabel(subview);
+        if (!inner) continue;
+        if (!found || CGRectGetMaxY(inner.frame) >= CGRectGetMaxY(found.frame)) found = inner;
+    }
+    return found;
+}
+
+static BOOL sm_cellIsDeleted(UIView *cell) {
+    if (!keepDeleted()) return NO;
+    if (sm_treeHasDeletedText(cell)) return YES;
+    id message = sm_boundMessage(cell);
+    if (!message) {
+        for (UIView *subview in cell.subviews) {
+            message = sm_boundMessage(subview);
+            if (message) break;
+        }
+    }
+    if (!message) return NO;
+    if (sm_isKeptKey(sm_call(message, "primaryKey"))) return YES;
+    if (sm_isKeptServerId(sm_call(message, "serverId"))) return YES;
+    return sm_isDeletedBody(sm_messageBody(message));
 }
 
 static UIView *sm_messageBubble(UIView *cell) {
@@ -2029,47 +2093,60 @@ static UIView *sm_messageBubble(UIView *cell) {
     return best;
 }
 
+static BOOL sm_inHistoryList(UIView *view) {
+    for (UIView *cursor = view; cursor; cursor = cursor.superview) {
+        const char *name = class_getName(object_getClass(cursor));
+        if (name && strstr(name, "HistoryCollection")) return YES;
+    }
+    return NO;
+}
+
 static void sm_updateDeletedCell(UIView *cell) {
-    if (!sm_isHistoryMessageCell(cell)) return;
-    static BOOL busy;
-    if (busy) return;
-    busy = YES;
-    BOOL deleted = keepDeleted() && sm_treeHasDeletedText(cell);
+    BOOL historyCell = sm_isHistoryMessageCell(cell);
+    if (!historyCell && (![cell isKindOfClass:[UICollectionViewCell class]] || !sm_inHistoryList(cell))) return;
+    static char smTrashBusyKey;
+    if (objc_getAssociatedObject(cell, &smTrashBusyKey)) return;
+    objc_setAssociatedObject(cell, &smTrashBusyKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    BOOL deleted = sm_cellIsDeleted(cell);
     UIView *bubble = sm_messageBubble(cell);
-    UILabel *badge = (UILabel *)[cell viewWithTag:kDeletedBadgeTag];
+    UIView *badge = [cell viewWithTag:kDeletedBadgeTag];
     if (!deleted) {
         if (badge) [badge removeFromSuperview];
-        if (bubble && fabs(bubble.alpha - 1) > 0.01) bubble.alpha = 1;
-        busy = NO;
+        if (bubble && bubble.alpha < 0.99) bubble.alpha = 1;
+        objc_setAssociatedObject(cell, &smTrashBusyKey, nil, OBJC_ASSOCIATION_ASSIGN);
         return;
     }
-    if (bubble) bubble.alpha = 0.62;
-    if (sm_treeHasMark(cell)) {
-        if (badge) [badge removeFromSuperview];
-        busy = NO;
-        return;
+    if (bubble && bubble.alpha < 0.99) bubble.alpha = 1;
+    UIImageView *icon = [badge isKindOfClass:[UIImageView class]] ? (UIImageView *)badge : nil;
+    if (!icon) {
+        [badge removeFromSuperview];
+        icon = [[UIImageView alloc] init];
+        icon.tag = kDeletedBadgeTag;
+        icon.contentMode = UIViewContentModeScaleAspectFit;
+        icon.userInteractionEnabled = NO;
+        UIImageSymbolConfiguration *config = [UIImageSymbolConfiguration configurationWithPointSize:11 weight:UIImageSymbolWeightSemibold];
+        icon.image = [[UIImage systemImageNamed:@"trash" withConfiguration:config] imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+        icon.tintColor = [UIColor colorWithRed:1 green:0.23 blue:0.19 alpha:1];
+        UIView *host = bubble ?: cell;
+        [host addSubview:icon];
     }
-    if (![badge isKindOfClass:[UILabel class]]) {
-        badge = [[UILabel alloc] init];
-        badge.tag = kDeletedBadgeTag;
-        badge.text = @"❌";
-        badge.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
-        badge.userInteractionEnabled = NO;
-        badge.backgroundColor = [UIColor clearColor];
-        [cell addSubview:badge];
+    UIView *host = icon.superview ?: bubble ?: cell;
+    CGFloat side = 13;
+    CGRect frame = CGRectMake(host.bounds.size.width - side - 6, host.bounds.size.height - side - 5, side, side);
+    UILabel *time = sm_timeLabel(bubble ?: cell);
+    if (time) {
+        CGRect timeFrame = [time convertRect:time.bounds toView:host];
+        CGFloat x = CGRectGetMaxX(timeFrame) + 3;
+        CGFloat limit = host.bounds.size.width - side - 3;
+        if (x > limit) x = limit;
+        if (x < 2) x = 2;
+        CGFloat y = CGRectGetMidY(timeFrame) - side / 2.0;
+        if (y < 1) y = 1;
+        frame = CGRectMake(x, y, side, side);
     }
-    CGRect frame = bubble ? [bubble convertRect:bubble.bounds toView:cell] : CGRectInset(cell.bounds, 12, 8);
-    BOOL outgoing = CGRectGetMidX(frame) > CGRectGetMidX(cell.bounds);
-    CGFloat side = 18;
-    CGFloat x = outgoing ? CGRectGetMinX(frame) - side - 3 : CGRectGetMaxX(frame) + 3;
-    CGFloat y = CGRectGetMidY(frame) - side / 2.0;
-    if (x < 1) x = 1;
-    CGFloat maxX = cell.bounds.size.width - side - 1;
-    if (x > maxX) x = MAX(1, maxX);
-    if (y < 1) y = 1;
-    badge.frame = CGRectMake(x, y, side, side);
-    [cell bringSubviewToFront:badge];
-    busy = NO;
+    icon.frame = frame;
+    [host bringSubviewToFront:icon];
+    objc_setAssociatedObject(cell, &smTrashBusyKey, nil, OBJC_ASSOCIATION_ASSIGN);
 }
 
 static void sm_markDeletedTree(UIView *view) {
