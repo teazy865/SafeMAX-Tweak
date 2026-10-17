@@ -5,6 +5,8 @@
 #import <dlfcn.h>
 #import <limits.h>
 #import <QuartzCore/QuartzCore.h>
+#import <AVFoundation/AVFoundation.h>
+#import <UserNotifications/UserNotifications.h>
 
 // SafeMAX bottom dock is OMUIKit.TabBar, not UITabBar.
 // Never hide or fade existing subviews: that removes the icons.
@@ -16,6 +18,7 @@ static NSString *const kGhostKey = @"SafeMAX_GhostMode";
 static NSString *const kAntiReadKey = @"SafeMAX_AntiRead";
 static NSString *const kKeepDeletedKey = @"SafeMAX_KeepDeleted";
 static NSString *const kKeepEditsKey = @"SafeMAX_KeepEdits";
+static NSString *const kBgNotifyKey = @"SafeMAX_BgNotify";
 
 static const NSInteger kEntryTag = 0x5AF1;
 static const NSInteger kPillTag = 0x5AF3;
@@ -65,6 +68,13 @@ static BOOL keepEdits(void) {
     id obj = [[NSUserDefaults standardUserDefaults] objectForKey:kKeepEditsKey];
     return obj ? [obj boolValue] : NO;
 }
+
+static BOOL bgNotify(void) {
+    id obj = [[NSUserDefaults standardUserDefaults] objectForKey:kBgNotifyKey];
+    return obj ? [obj boolValue] : NO;
+}
+
+static void sm_bgNotifyChanged(BOOL on);
 
 static NSArray<NSString *> *savedOrder(void) {
     id obj = [[NSUserDefaults standardUserDefaults] arrayForKey:kOrderKey];
@@ -697,6 +707,7 @@ static void presentEditor(UIViewController *from) {
         case 1: key = kAntiReadKey; break;
         case 2: key = kKeepDeletedKey; break;
         case 3: key = kKeepEditsKey; break;
+        case 4: key = kBgNotifyKey; break;
         default: break;
     }
     [[NSUserDefaults standardUserDefaults] setBool:sender.on forKey:key];
@@ -704,11 +715,12 @@ static void presentEditor(UIViewController *from) {
         g_keepDeleted = sender.on;
         g_keepDeletedLoaded = YES;
     }
+    if (key == kBgNotifyKey) sm_bgNotifyChanged(sender.on);
 }
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 1; }
 
-- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section { return 4; }
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section { return 5; }
 
 - (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath { return 60; }
 
@@ -736,10 +748,15 @@ static void presentEditor(UIViewController *from) {
             cell.detailTextLabel.text = @"Остаются после перезапуска, тускнеют и помечаются ❌";
             on = keepDeleted();
             break;
-        default:
+        case 3:
             cell.textLabel.text = @"История правок";
             cell.detailTextLabel.text = @"Старый текст остаётся под новым";
             on = keepEdits();
+            break;
+        default:
+            cell.textLabel.text = @"Фоновые уведомления";
+            cell.detailTextLabel.text = @"Баннер, когда MAX свёрнут, но не выгружен";
+            on = bgNotify();
             break;
     }
     UISwitch *toggle = [[UISwitch alloc] init];
@@ -1845,6 +1862,183 @@ static void hookKeepEdits(void) {
     }
 }
 
+static AVAudioPlayer *smSilentPlayer;
+static NSTimer *smAudioTimer;
+static BOOL smAudioOwned;
+static IMP orig_keepSocket;
+static IMP orig_disconnectIfNeeded;
+static IMP orig_messageReceived;
+
+static NSData *sm_silentWav(void) {
+    const uint32_t rate = 16000;
+    const uint32_t frames = rate;
+    const uint16_t channels = 1;
+    const uint16_t bits = 16;
+    uint32_t dataSize = frames * channels * (bits / 8);
+    uint32_t riffSize = 36 + dataSize;
+    uint32_t fmtSize = 16;
+    uint16_t audioFormat = 1;
+    uint32_t byteRate = rate * channels * (bits / 8);
+    uint16_t blockAlign = channels * (bits / 8);
+    NSMutableData *data = [NSMutableData dataWithLength:44 + dataSize];
+    uint8_t *bytes = data.mutableBytes;
+    memcpy(bytes, "RIFF", 4);
+    memcpy(bytes + 4, &riffSize, 4);
+    memcpy(bytes + 8, "WAVEfmt ", 8);
+    memcpy(bytes + 16, &fmtSize, 4);
+    memcpy(bytes + 20, &audioFormat, 2);
+    memcpy(bytes + 22, &channels, 2);
+    memcpy(bytes + 24, &rate, 4);
+    memcpy(bytes + 28, &byteRate, 4);
+    memcpy(bytes + 32, &blockAlign, 2);
+    memcpy(bytes + 34, &bits, 2);
+    memcpy(bytes + 36, "data", 4);
+    memcpy(bytes + 40, &dataSize, 4);
+    return data;
+}
+
+static BOOL sm_audioBusy(void) {
+    AVAudioSession *session = [AVAudioSession sharedInstance];
+    NSString *category = session.category;
+    return [category isEqualToString:AVAudioSessionCategoryPlayAndRecord] || [category isEqualToString:AVAudioSessionCategoryRecord];
+}
+
+static void sm_startSilentAudio(void) {
+    if (!bgNotify() || sm_audioBusy()) return;
+    NSError *error = nil;
+    AVAudioSession *session = [AVAudioSession sharedInstance];
+    [session setCategory:AVAudioSessionCategoryPlayback withOptions:AVAudioSessionCategoryOptionMixWithOthers error:&error];
+    [session setActive:YES error:&error];
+    if (!smSilentPlayer) {
+        smSilentPlayer = [[AVAudioPlayer alloc] initWithData:sm_silentWav() error:&error];
+        smSilentPlayer.numberOfLoops = -1;
+        smSilentPlayer.volume = 1;
+    }
+    if (smSilentPlayer && !smSilentPlayer.playing) [smSilentPlayer play];
+    smAudioOwned = smSilentPlayer.playing;
+}
+
+static void sm_stopSilentAudio(void) {
+    [smSilentPlayer stop];
+    if (!smAudioOwned) return;
+    smAudioOwned = NO;
+    if (sm_audioBusy()) return;
+    [[AVAudioSession sharedInstance] setActive:NO withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation error:nil];
+}
+
+static void sm_ensureAudioTimer(void) {
+    if (smAudioTimer) return;
+    smAudioTimer = [NSTimer scheduledTimerWithTimeInterval:15 repeats:YES block:^(__unused NSTimer *timer) {
+        if (!bgNotify()) return;
+        if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive) return;
+        sm_startSilentAudio();
+    }];
+}
+
+static BOOL swizzled_keepSocket(id self, SEL _cmd) {
+    if (bgNotify()) return YES;
+    return orig_keepSocket ? ((BOOL (*)(id, SEL))orig_keepSocket)(self, _cmd) : NO;
+}
+
+static void swizzled_disconnectIfNeeded(id self, SEL _cmd) {
+    if (bgNotify() && UIApplication.sharedApplication.applicationState != UIApplicationStateActive) return;
+    if (orig_disconnectIfNeeded) ((void (*)(id, SEL))orig_disconnectIfNeeded)(self, _cmd);
+}
+
+static NSString *sm_noteTitle(id chat) {
+    const char *names[] = {"localTitle", "title", "displayTitle", "chatTitle", "name", NULL};
+    for (int i = 0; names[i]; i++) {
+        id value = sm_call(chat, names[i]);
+        if ([value isKindOfClass:[NSString class]] && [value length]) return value;
+    }
+    return @"MAX";
+}
+
+static void sm_postIncoming(id note) {
+    if (!bgNotify() || !note) return;
+    if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive) return;
+    SEL invisible = sel_registerName("invisible");
+    if ([note respondsToSelector:invisible] && ((BOOL (*)(id, SEL))objc_msgSend)(note, invisible)) return;
+    id message = sm_call(note, "message");
+    if (!message) message = note;
+    if ([message respondsToSelector:@selector(my)] && ((BOOL (*)(id, SEL))objc_msgSend)(message, @selector(my))) return;
+    id chat = sm_call(note, "chat");
+    SEL muted = @selector(isMuted);
+    SEL disabled = sel_registerName("notificationsDisabled");
+    SEL disturb = sel_registerName("isDontDisturb");
+    if (chat && [chat respondsToSelector:muted] && ((BOOL (*)(id, SEL))objc_msgSend)(chat, muted)) return;
+    if (chat && [chat respondsToSelector:disabled] && ((BOOL (*)(id, SEL))objc_msgSend)(chat, disabled)) return;
+    if (chat && [chat respondsToSelector:disturb] && ((BOOL (*)(id, SEL))objc_msgSend)(chat, disturb)) return;
+    NSString *body = sm_messageBody(message);
+    if ([body containsString:@"\n—— было ——\n"]) body = [[body componentsSeparatedByString:@"\n—— было ——\n"] lastObject];
+    body = [body stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (body.length > 180) body = [[body substringToIndex:180] stringByAppendingString:@"…"];
+    if (body.length == 0) body = @"Новое сообщение";
+    id contact = sm_call(message, "senderContact");
+    NSString *sender = sm_call(contact, "fullName");
+    if (![sender isKindOfClass:[NSString class]] || sender.length == 0) sender = sm_call(contact, "name");
+    NSString *title = sm_noteTitle(chat);
+    if ([sender isKindOfClass:[NSString class]] && sender.length && ![sender isEqualToString:title]) {
+        body = [NSString stringWithFormat:@"%@: %@", sender, body];
+    }
+    UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
+    content.title = title.length ? title : @"MAX";
+    content.body = body;
+    content.sound = [UNNotificationSound defaultSound];
+    id chatId = sm_call(note, "chatId");
+    if (!chatId) chatId = sm_call(message, "chatId");
+    if ([chatId respondsToSelector:@selector(stringValue)]) content.threadIdentifier = [chatId stringValue];
+    id serverId = sm_call(message, "serverId");
+    NSString *identifier = [serverId respondsToSelector:@selector(stringValue)] ? [serverId stringValue] : nil;
+    if (identifier.length == 0) identifier = [NSString stringWithFormat:@"sm-%llu", (unsigned long long)(NSDate.date.timeIntervalSince1970 * 1000)];
+    UNNotificationRequest *request = [UNNotificationRequest requestWithIdentifier:identifier content:content trigger:nil];
+    [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:request withCompletionHandler:nil];
+}
+
+static void swizzled_messageReceived(id self, SEL _cmd, id note) {
+    if (orig_messageReceived) ((void (*)(id, SEL, id))orig_messageReceived)(self, _cmd, note);
+    sm_postIncoming(note);
+}
+
+static void sm_bgNotifyChanged(BOOL on) {
+    if (!on) {
+        sm_stopSilentAudio();
+        return;
+    }
+    UNAuthorizationOptions options = UNAuthorizationOptionAlert | UNAuthorizationOptionSound;
+    [[UNUserNotificationCenter currentNotificationCenter] requestAuthorizationWithOptions:options completionHandler:^(__unused BOOL granted, __unused NSError *error) {}];
+    sm_ensureAudioTimer();
+    if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) sm_startSilentAudio();
+}
+
+static void hookBgNotify(void) {
+    sm_hook_own(objc_getClass("OKMAppStateManager"), "keepSocketInBackground", (IMP)swizzled_keepSocket, &orig_keepSocket);
+    sm_hook_own(objc_getClass("OKMMessengerClient"), "disconnectIfNeeded", (IMP)swizzled_disconnectIfNeeded, &orig_disconnectIfNeeded);
+    sm_hook_own(objc_getClass("OKMIncomingMessagesListener"), "_messageReceived:", (IMP)swizzled_messageReceived, &orig_messageReceived);
+    static BOOL watching;
+    if (watching) return;
+    watching = YES;
+    sm_ensureAudioTimer();
+    NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
+    [center addObserverForName:UIApplicationWillResignActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
+        if (bgNotify()) sm_startSilentAudio();
+    }];
+    [center addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
+        if (bgNotify()) sm_startSilentAudio();
+    }];
+    [center addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
+        sm_stopSilentAudio();
+    }];
+    [center addObserverForName:AVAudioSessionInterruptionNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
+        NSNumber *type = note.userInfo[AVAudioSessionInterruptionTypeKey];
+        if (type.unsignedIntegerValue == AVAudioSessionInterruptionTypeEnded && bgNotify() &&
+            UIApplication.sharedApplication.applicationState != UIApplicationStateActive) {
+            sm_startSilentAudio();
+        }
+    }];
+    if (bgNotify()) sm_bgNotifyChanged(YES);
+}
+
 static void hookGhost(void) {
     static BOOL hooked;
     if (hooked) return;
@@ -1870,6 +2064,7 @@ static void resolveAndHook(void) {
     hookAntiRead();
     hookKeepDeleted();
     hookKeepEdits();
+    hookBgNotify();
     if (hooked) return;
     hooked = YES;
 
@@ -1907,6 +2102,7 @@ static void safeMAXDockInit(void) {
     hookAntiRead();
     hookKeepDeleted();
     hookKeepEdits();
+    hookBgNotify();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         resolveAndHook();
     });
@@ -1915,6 +2111,7 @@ static void safeMAXDockInit(void) {
     });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         hookKeepDeleted();
+        hookBgNotify();
     });
 }
 
