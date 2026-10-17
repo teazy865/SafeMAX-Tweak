@@ -14,6 +14,7 @@
 
 static NSString *const kShowLabelsKey = @"SafeMAX_ShowLabels";
 static NSString *const kFloatingKey = @"SafeMAX_FloatingDock";
+static NSString *const kLiquidGlassKey = @"SafeMAX_LiquidGlass";
 static NSString *const kOrderKey = @"SafeMAX_TabOrder";
 static NSString *const kGhostKey = @"SafeMAX_GhostMode";
 static NSString *const kAntiReadKey = @"SafeMAX_AntiRead";
@@ -40,6 +41,11 @@ static BOOL showLabels(void) {
 
 static BOOL floatingDock(void) {
     id obj = [[NSUserDefaults standardUserDefaults] objectForKey:kFloatingKey];
+    return obj ? [obj boolValue] : YES;
+}
+
+static BOOL liquidGlass(void) {
+    id obj = [[NSUserDefaults standardUserDefaults] objectForKey:kLiquidGlassKey];
     return obj ? [obj boolValue] : YES;
 }
 
@@ -579,8 +585,13 @@ static void presentGhost(UIViewController *from);
     NSNumber *row = objc_getAssociatedObject(sender, "sm_row");
     if (row.integerValue == 0) {
         [[NSUserDefaults standardUserDefaults] setBool:sender.on forKey:kShowLabelsKey];
-    } else {
+    } else if (row.integerValue == 1) {
         [[NSUserDefaults standardUserDefaults] setBool:sender.on forKey:kFloatingKey];
+    } else {
+        [[NSUserDefaults standardUserDefaults] setBool:sender.on forKey:kLiquidGlassKey];
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Жидкое стекло" message:@"Закрой приложение полностью и открой снова. Иначе переключатель не применится." preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"Хорошо" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
     }
     styleAllBars();
 }
@@ -588,7 +599,7 @@ static void presentGhost(UIViewController *from);
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 2; }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return section == 0 ? 2 : self.titles.count;
+    return section == 0 ? 3 : self.titles.count;
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
@@ -596,6 +607,7 @@ static void presentGhost(UIViewController *from);
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
+    if (section == 0) return @"Стекло включается после полного перезапуска. Если меню зависает, выключи его.";
     return section == 1 ? @"Удерживайте полоски справа и перетаскивайте вкладки." : nil;
 }
 
@@ -607,8 +619,15 @@ static void presentGhost(UIViewController *from);
     cell.selectionStyle = UITableViewCellSelectionStyleNone;
     UISwitch *toggle = [cell.contentView viewWithTag:9];
     if (indexPath.section == 0) {
-        NSString *title = indexPath.row == 0 ? @"Текст под иконками" : @"Парящий док";
-        BOOL on = indexPath.row == 0 ? showLabels() : floatingDock();
+        NSString *title = @"Текст под иконками";
+        BOOL on = showLabels();
+        if (indexPath.row == 1) {
+            title = @"Парящий док";
+            on = floatingDock();
+        } else if (indexPath.row == 2) {
+            title = @"Жидкое стекло";
+            on = liquidGlass();
+        }
         cell.textLabel.text = title;
         if (!toggle) {
             toggle = [[UISwitch alloc] init];
@@ -759,7 +778,7 @@ static void presentEditor(UIViewController *from) {
             break;
         default:
             cell.textLabel.text = @"Фоновые уведомления";
-            cell.detailTextLabel.text = @"Баннер, когда MAX свёрнут, но не выгружен";
+            cell.detailTextLabel.text = @"Баннер, когда Max свёрнут, но не выгружен";
             on = bgNotify();
             break;
     }
@@ -2385,14 +2404,14 @@ static NSString *sm_noteTitle(id chat) {
         id value = sm_call(chat, names[i]);
         if ([value isKindOfClass:[NSString class]] && [value length]) return value;
     }
-    return @"MAX";
+    return @"Max";
 }
 
 static void sm_deliver(NSString *title, NSString *body) {
     if (!bgNotify()) return;
     if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive) return;
     if (body.length == 0) body = @"Новое сообщение";
-    if (title.length == 0) title = @"MAX";
+    if (title.length == 0) title = @"Max";
     NSString *key = [title stringByAppendingString:body];
     NSTimeInterval now = [NSDate date].timeIntervalSince1970;
     static NSString *lastKey;
@@ -2599,7 +2618,7 @@ static void sm_warnIfNotificationsDenied(void) {
             UIViewController *from = topController();
             if (!from) return;
             UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Нет доступа к уведомлениям"
-                                                                           message:@"Включи уведомления для MAX в Настройках iPhone, иначе баннер не появится."
+                                                                           message:@"Включи уведомления для Max в Настройках iPhone, иначе баннер не появится."
                                                                     preferredStyle:UIAlertControllerStyleAlert];
             [alert addAction:[UIAlertAction actionWithTitle:@"Понятно" style:UIAlertActionStyleDefault handler:nil]];
             [from presentViewController:alert animated:YES completion:nil];
@@ -2740,13 +2759,19 @@ static NSDictionary *swizzled_infoDictionary(id self, SEL _cmd) {
     NSDictionary *dict = ((NSDictionary *(*)(id, SEL))orig_infoDictionary)(self, _cmd);
     if (g_inInfo || self != [NSBundle mainBundle] || ![dict isKindOfClass:[NSDictionary class]]) return dict;
     NSMutableDictionary *copy = [dict mutableCopy];
-    copy[@"UIDesignRequiresCompatibility"] = @NO;
+    g_inInfo = YES;
+    BOOL glass = liquidGlass();
+    g_inInfo = NO;
+    copy[@"UIDesignRequiresCompatibility"] = glass ? @NO : @YES;
     return copy;
 }
 
 static id swizzled_infoKey(id self, SEL _cmd, NSString *key) {
     if (!g_inInfo && self == [NSBundle mainBundle] && [key isEqualToString:@"UIDesignRequiresCompatibility"]) {
-        return @NO;
+        g_inInfo = YES;
+        BOOL glass = liquidGlass();
+        g_inInfo = NO;
+        return glass ? @NO : @YES;
     }
     return ((id (*)(id, SEL, NSString *))orig_infoKey)(self, _cmd, key);
 }
