@@ -7,6 +7,7 @@
 #import <QuartzCore/QuartzCore.h>
 #import <AVFoundation/AVFoundation.h>
 #import <UserNotifications/UserNotifications.h>
+#import <CoreLocation/CoreLocation.h>
 
 // SafeMAX bottom dock is OMUIKit.TabBar, not UITabBar.
 // Never hide or fade existing subviews: that removes the icons.
@@ -1179,6 +1180,7 @@ static NSLock *smDeletedLock;
 static NSArray *g_lookupIds;
 static id g_lookupChat;
 static NSMutableArray *g_lookupSnaps;
+static NSMutableArray *g_lookupMessages;
 
 static void sm_loadDeletedBodies(void) {
     static dispatch_once_t once;
@@ -1207,6 +1209,7 @@ static BOOL sm_isDeletedBody(NSString *text) {
     if (text.length == 0) return NO;
     NSString *trimmed = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (trimmed.length == 0) return NO;
+    if ([trimmed rangeOfString:@"❌"].location != NSNotFound) return YES;
     sm_loadDeletedBodies();
     [smDeletedLock lock];
     BOOL hit = [smDeletedBodies containsObject:trimmed];
@@ -1378,6 +1381,7 @@ static void sm_lookup_invoke(void *block, id transaction) {
                 message = ((id (*)(id, SEL, id))objc_msgSend)(transaction, byPk, item);
             }
             NSDictionary *snap = sm_snapshot(message);
+            if (message) [g_lookupMessages addObject:message];
             if (snap) [g_lookupSnaps addObject:snap];
             else {
                 NSString *body = sm_messageBody(item);
@@ -1408,6 +1412,83 @@ static id sm_readBlock(void) {
     return ready ? (__bridge id)&block : nil;
 }
 
+static id g_writeMessage;
+static id g_writeKey;
+
+static void sm_write_invoke(void *block, id transaction) {
+    (void)block;
+    if (!g_writeMessage || !g_writeKey) return;
+    SEL sel = @selector(setObject:forKey:inCollection:);
+    if (![transaction respondsToSelector:sel]) return;
+    ((void (*)(id, SEL, id, id, id))objc_msgSend)(transaction, sel, g_writeMessage, g_writeKey, @"messages");
+}
+
+static id sm_writeBlock(void) {
+    static SMBlockLiteral block;
+    static struct { unsigned long reserved; unsigned long size; const char *signature; const char *layout; } desc;
+    static dispatch_once_t once;
+    static BOOL ready;
+    dispatch_once(&once, ^{
+        void *isa = dlsym(RTLD_DEFAULT, "_NSConcreteGlobalBlock");
+        if (!isa) return;
+        desc.size = sizeof(block);
+        desc.signature = "v16@?0@8";
+        desc.layout = "\0";
+        block.isa = isa;
+        block.flags = (1 << 28) | (1 << 30);
+        block.invoke = (void *)sm_write_invoke;
+        block.descriptor = &desc;
+        ready = YES;
+    });
+    return ready ? (__bridge id)&block : nil;
+}
+
+static void sm_prefixDeletedMark(id message) {
+    if (!message || (smMessageClass && ![message isKindOfClass:smMessageClass] && ![message respondsToSelector:@selector(messageText)])) return;
+    id messageText = sm_call(message, "messageText");
+    NSString *text = nil;
+    Ivar ivar = sm_textIvar(messageText, &text);
+    if (text.length == 0) text = sm_messageBody(message);
+    if (text.length == 0 || [text rangeOfString:@"❌"].location != NSNotFound) return;
+    NSString *marked = [@"❌ " stringByAppendingString:text];
+    if (messageText && [messageText respondsToSelector:@selector(setText:)]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(messageText, @selector(setText:), marked);
+    } else if (ivar && messageText) {
+        object_setIvar(messageText, ivar, marked);
+    }
+}
+
+static void sm_writeMarkedMessage(id connection, id message) {
+    if (!connection || !message) return;
+    id key = sm_call(message, "primaryKey");
+    if (![key isKindOfClass:[NSString class]] || ![key length]) return;
+    id block = sm_writeBlock();
+    if (!block || ![connection respondsToSelector:@selector(readWriteWithBlock:)]) return;
+    g_writeMessage = message;
+    g_writeKey = key;
+    @try {
+        ((void (*)(id, SEL, id))objc_msgSend)(connection, @selector(readWriteWithBlock:), block);
+    } @catch (__unused NSException *exception) {
+    }
+    g_writeMessage = nil;
+    g_writeKey = nil;
+}
+
+static void sm_reloadView(UIView *view) {
+    const char *name = class_getName(object_getClass(view));
+    if (name && strstr(name, "HistoryCollectionView") && [view isKindOfClass:[UICollectionView class]]) {
+        [(UICollectionView *)view reloadData];
+    }
+    for (UIView *subview in view.subviews) sm_reloadView(subview);
+}
+
+static void sm_reloadHistory(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        for (UIWindow *window in allWindows()) sm_reloadView(window);
+        sm_refreshDeletedLooks();
+    });
+}
+
 static id sm_readConnection(id serviceOwner) {
     id conn = sm_call(serviceOwner, "dbConnection");
     if (!conn) conn = sm_call(serviceOwner, "readConnection");
@@ -1431,6 +1512,7 @@ static void sm_noteDeletedPayload(id ids, id chat, id serviceOwner) {
     g_lookupIds = items;
     g_lookupChat = chat;
     g_lookupSnaps = [NSMutableArray array];
+    g_lookupMessages = [NSMutableArray array];
     id connection = sm_readConnection(serviceOwner);
     id block = sm_readBlock();
     BOOL ran = NO;
@@ -1444,6 +1526,7 @@ static void sm_noteDeletedPayload(id ids, id chat, id serviceOwner) {
     }
     if (!ran) {
         for (id item in items) {
+            if (smMessageClass && [item isKindOfClass:smMessageClass]) [g_lookupMessages addObject:item];
             NSDictionary *snap = sm_snapshot(item);
             if (snap) [g_lookupSnaps addObject:snap];
             else {
@@ -1453,10 +1536,12 @@ static void sm_noteDeletedPayload(id ids, id chat, id serviceOwner) {
         }
     }
     NSArray *snaps = [g_lookupSnaps copy];
+    NSArray *messages = [g_lookupMessages copy];
     id chatRef = chat;
     g_lookupIds = nil;
     g_lookupChat = nil;
     g_lookupSnaps = nil;
+    g_lookupMessages = nil;
     for (NSDictionary *snap in snaps) {
         if (![snap isKindOfClass:[NSDictionary class]]) continue;
         NSMutableDictionary *rich = [snap mutableCopy];
@@ -1471,7 +1556,11 @@ static void sm_noteDeletedPayload(id ids, id chat, id serviceOwner) {
         }
         sm_rememberSnapshot(rich);
     }
-    if (snaps.count) sm_refreshDeletedLooks();
+    for (id message in messages) {
+        sm_prefixDeletedMark(message);
+        sm_writeMarkedMessage(connection, message);
+    }
+    if (snaps.count || messages.count) sm_reloadHistory();
 }
 
 static BOOL sm_sameChat(NSDictionary *rec, id sample) {
@@ -1565,6 +1654,9 @@ static id sm_mergeKeptInto(id page, id messages) {
     for (id message in current) {
         NSString *key = sm_msgKey(message);
         if (key) [seen addObject:key];
+        if (sm_isKeptKey(sm_call(message, "primaryKey")) || sm_isKeptServerId(sm_call(message, "serverId"))) {
+            sm_prefixDeletedMark(message);
+        }
         long long ts = sm_callLL(message, "timestampAsInt");
         if (ts < minTs) minTs = ts;
         if (ts > maxTs) maxTs = ts;
@@ -1894,6 +1986,8 @@ static NSData *sm_silentWav(void) {
     memcpy(bytes + 34, &bits, 2);
     memcpy(bytes + 36, "data", 4);
     memcpy(bytes + 40, &dataSize, 4);
+    int16_t *samples = (int16_t *)(bytes + 44);
+    for (uint32_t i = 0; i < frames; i++) samples[i] = (i & 32) ? 8 : -8;
     return data;
 }
 
@@ -1932,6 +2026,7 @@ static void sm_ensureAudioTimer(void) {
         if (!bgNotify()) return;
         if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive) return;
         sm_startSilentAudio();
+        sm_startLocation();
     }];
 }
 
@@ -1954,26 +2049,38 @@ static NSString *sm_noteTitle(id chat) {
     return @"MAX";
 }
 
+static void sm_deliver(NSString *title, NSString *body) {
+    if (!bgNotify()) return;
+    if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive) return;
+    if (body.length == 0) body = @"Новое сообщение";
+    if (title.length == 0) title = @"MAX";
+    NSString *key = [title stringByAppendingString:body];
+    NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+    static NSString *lastKey;
+    static NSTimeInterval lastTime;
+    if (lastKey && [lastKey isEqualToString:key] && now - lastTime < 3) return;
+    lastKey = key;
+    lastTime = now;
+    UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
+    content.title = title;
+    content.body = body;
+    content.sound = [UNNotificationSound defaultSound];
+    NSString *identifier = [NSString stringWithFormat:@"sm-%llu", (unsigned long long)(now * 1000)];
+    UNNotificationRequest *request = [UNNotificationRequest requestWithIdentifier:identifier content:content trigger:nil];
+    [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:request withCompletionHandler:nil];
+}
+
 static void sm_postIncoming(id note) {
     if (!bgNotify() || !note) return;
     if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive) return;
-    SEL invisible = sel_registerName("invisible");
-    if ([note respondsToSelector:invisible] && ((BOOL (*)(id, SEL))objc_msgSend)(note, invisible)) return;
     id message = sm_call(note, "message");
     if (!message) message = note;
     if ([message respondsToSelector:@selector(my)] && ((BOOL (*)(id, SEL))objc_msgSend)(message, @selector(my))) return;
     id chat = sm_call(note, "chat");
-    SEL muted = @selector(isMuted);
-    SEL disabled = sel_registerName("notificationsDisabled");
-    SEL disturb = sel_registerName("isDontDisturb");
-    if (chat && [chat respondsToSelector:muted] && ((BOOL (*)(id, SEL))objc_msgSend)(chat, muted)) return;
-    if (chat && [chat respondsToSelector:disabled] && ((BOOL (*)(id, SEL))objc_msgSend)(chat, disabled)) return;
-    if (chat && [chat respondsToSelector:disturb] && ((BOOL (*)(id, SEL))objc_msgSend)(chat, disturb)) return;
     NSString *body = sm_messageBody(message);
     if ([body containsString:@"\n—— было ——\n"]) body = [[body componentsSeparatedByString:@"\n—— было ——\n"] lastObject];
     body = [body stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (body.length > 180) body = [[body substringToIndex:180] stringByAppendingString:@"…"];
-    if (body.length == 0) body = @"Новое сообщение";
     id contact = sm_call(message, "senderContact");
     NSString *sender = sm_call(contact, "fullName");
     if (![sender isKindOfClass:[NSString class]] || sender.length == 0) sender = sm_call(contact, "name");
@@ -1981,18 +2088,22 @@ static void sm_postIncoming(id note) {
     if ([sender isKindOfClass:[NSString class]] && sender.length && ![sender isEqualToString:title]) {
         body = [NSString stringWithFormat:@"%@: %@", sender, body];
     }
-    UNMutableNotificationContent *content = [[UNMutableNotificationContent alloc] init];
-    content.title = title.length ? title : @"MAX";
-    content.body = body;
-    content.sound = [UNNotificationSound defaultSound];
-    id chatId = sm_call(note, "chatId");
-    if (!chatId) chatId = sm_call(message, "chatId");
-    if ([chatId respondsToSelector:@selector(stringValue)]) content.threadIdentifier = [chatId stringValue];
-    id serverId = sm_call(message, "serverId");
-    NSString *identifier = [serverId respondsToSelector:@selector(stringValue)] ? [serverId stringValue] : nil;
-    if (identifier.length == 0) identifier = [NSString stringWithFormat:@"sm-%llu", (unsigned long long)(NSDate.date.timeIntervalSince1970 * 1000)];
-    UNNotificationRequest *request = [UNNotificationRequest requestWithIdentifier:identifier content:content trigger:nil];
-    [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:request withCompletionHandler:nil];
+    sm_deliver(title, body);
+}
+
+static IMP orig_showBanner;
+static void swizzled_showBanner(id self, SEL _cmd, id banner, BOOL suppress) {
+    if (orig_showBanner) ((void (*)(id, SEL, id, BOOL))orig_showBanner)(self, _cmd, banner, suppress);
+    if (!bgNotify() || UIApplication.sharedApplication.applicationState == UIApplicationStateActive) return;
+    NSString *title = nil;
+    NSString *body = nil;
+    id titleLabel = sm_call(banner, "titleLabel");
+    id textLabel = sm_call(banner, "textLabel");
+    if ([titleLabel isKindOfClass:[UILabel class]]) title = ((UILabel *)titleLabel).text;
+    if ([textLabel isKindOfClass:[UILabel class]]) body = ((UILabel *)textLabel).text;
+    if (title.length == 0 && [sm_call(banner, "title") isKindOfClass:[NSString class]]) title = sm_call(banner, "title");
+    if (body.length == 0 && [sm_call(banner, "text") isKindOfClass:[NSString class]]) body = sm_call(banner, "text");
+    if (title.length || body.length) sm_deliver(title, body);
 }
 
 static void swizzled_messageReceived(id self, SEL _cmd, id note) {
@@ -2000,14 +2111,90 @@ static void swizzled_messageReceived(id self, SEL _cmd, id note) {
     sm_postIncoming(note);
 }
 
+static CLLocationManager *smLoc;
+static id smLocDelegate;
+static BOOL smLocRunning;
+
+static void sm_startLocation(void);
+
+@interface SMBgLocator : NSObject <CLLocationManagerDelegate>
+@end
+
+@implementation SMBgLocator
+- (void)locationManagerDidChangeAuthorization:(CLLocationManager *)manager {
+    (void)manager;
+    if (bgNotify()) sm_startLocation();
+}
+- (void)locationManager:(CLLocationManager *)manager didUpdateLocations:(NSArray<CLLocation *> *)locations {
+    (void)manager;
+    (void)locations;
+}
+@end
+
+static void sm_startLocation(void) {
+    if (!bgNotify()) return;
+    if (!smLoc) {
+        smLocDelegate = [SMBgLocator new];
+        smLoc = [[CLLocationManager alloc] init];
+        smLoc.delegate = smLocDelegate;
+        smLoc.desiredAccuracy = kCLLocationAccuracyReduced;
+        smLoc.distanceFilter = kCLDistanceFilterNone;
+        smLoc.pausesLocationUpdatesAutomatically = NO;
+    }
+    CLAuthorizationStatus status;
+    if ([smLoc respondsToSelector:@selector(authorizationStatus)]) status = smLoc.authorizationStatus;
+    else status = [CLLocationManager authorizationStatus];
+    if (status == kCLAuthorizationStatusNotDetermined) {
+        static BOOL asked;
+        if (!asked) {
+            asked = YES;
+            [smLoc requestAlwaysAuthorization];
+        }
+        return;
+    }
+    if (status == kCLAuthorizationStatusDenied || status == kCLAuthorizationStatusRestricted) return;
+    if (smLocRunning) return;
+    @try {
+        smLoc.allowsBackgroundLocationUpdates = YES;
+        [smLoc startUpdatingLocation];
+        smLocRunning = YES;
+    } @catch (__unused NSException *exception) {
+        smLocRunning = NO;
+    }
+}
+
+static void sm_stopLocation(void) {
+    [smLoc stopUpdatingLocation];
+    smLocRunning = NO;
+}
+
+static void sm_warnIfNotificationsDenied(void) {
+    [[UNUserNotificationCenter currentNotificationCenter] getNotificationSettingsWithCompletionHandler:^(UNNotificationSettings *settings) {
+        if (settings.authorizationStatus != UNAuthorizationStatusDenied) return;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIViewController *from = topController();
+            if (!from) return;
+            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Нет доступа к уведомлениям"
+                                                                           message:@"Включи уведомления для MAX в Настройках iPhone, иначе баннер не появится."
+                                                                    preferredStyle:UIAlertControllerStyleAlert];
+            [alert addAction:[UIAlertAction actionWithTitle:@"Понятно" style:UIAlertActionStyleDefault handler:nil]];
+            [from presentViewController:alert animated:YES completion:nil];
+        });
+    }];
+}
+
 static void sm_bgNotifyChanged(BOOL on) {
     if (!on) {
         sm_stopSilentAudio();
+        sm_stopLocation();
         return;
     }
     UNAuthorizationOptions options = UNAuthorizationOptionAlert | UNAuthorizationOptionSound;
-    [[UNUserNotificationCenter currentNotificationCenter] requestAuthorizationWithOptions:options completionHandler:^(__unused BOOL granted, __unused NSError *error) {}];
+    [[UNUserNotificationCenter currentNotificationCenter] requestAuthorizationWithOptions:options completionHandler:^(__unused BOOL granted, __unused NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{ sm_warnIfNotificationsDenied(); });
+    }];
     sm_ensureAudioTimer();
+    sm_startLocation();
     if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) sm_startSilentAudio();
 }
 
@@ -2015,19 +2202,25 @@ static void hookBgNotify(void) {
     sm_hook_own(objc_getClass("OKMAppStateManager"), "keepSocketInBackground", (IMP)swizzled_keepSocket, &orig_keepSocket);
     sm_hook_own(objc_getClass("OKMMessengerClient"), "disconnectIfNeeded", (IMP)swizzled_disconnectIfNeeded, &orig_disconnectIfNeeded);
     sm_hook_own(objc_getClass("OKMIncomingMessagesListener"), "_messageReceived:", (IMP)swizzled_messageReceived, &orig_messageReceived);
+    sm_hook_own(objc_getClass("OKMInAppBannerPresenter"), "showNewMessageBanner:suppressToast:", (IMP)swizzled_showBanner, &orig_showBanner);
     static BOOL watching;
     if (watching) return;
     watching = YES;
     sm_ensureAudioTimer();
     NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
     [center addObserverForName:UIApplicationWillResignActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
-        if (bgNotify()) sm_startSilentAudio();
+        if (!bgNotify()) return;
+        sm_startSilentAudio();
+        sm_startLocation();
     }];
     [center addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
-        if (bgNotify()) sm_startSilentAudio();
+        if (!bgNotify()) return;
+        sm_startSilentAudio();
+        sm_startLocation();
     }];
     [center addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
         sm_stopSilentAudio();
+        sm_stopLocation();
     }];
     [center addObserverForName:AVAudioSessionInterruptionNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
         NSNumber *type = note.userInfo[AVAudioSessionInterruptionTypeKey];
