@@ -976,6 +976,10 @@ static NSDictionary *sm_snapshot(id message);
 static void sm_prefixDeletedMark(id message);
 static void sm_rememberSnapshot(NSDictionary *snap);
 static void sm_noteHistoryPage(id value);
+static void sm_scheduleRewrite(id owner);
+static BOOL sm_isKeptKey(id key);
+static id sm_call(id obj, const char *selName);
+static id sm_readConnection(id serviceOwner);
 
 static BOOL g_keepingDelete;
 
@@ -990,12 +994,15 @@ static id swizzled_deleteLocal(id self, SEL _cmd, id messageIds, id chat) {
 }
 
 static void swizzled_setStatus(id self, SEL _cmd, NSUInteger status) {
-    if (keepDeleted() && status == 2 && smMessageClass && [self isKindOfClass:smMessageClass]) {
-        NSDictionary *snap = sm_snapshot(self);
-        if (snap) sm_rememberSnapshot(snap);
-        else sm_rememberDeletedText(sm_messageBody(self));
-        sm_refreshDeletedLooks();
-        return;
+    if (keepDeleted() && smMessageClass && [self isKindOfClass:smMessageClass]) {
+        BOOL kept = sm_isKeptKey(sm_call(self, "primaryKey"));
+        if (g_keepingDelete || status == 2 || kept) {
+            NSDictionary *snap = sm_snapshot(self);
+            if (snap) sm_rememberSnapshot(snap);
+            else sm_rememberDeletedText(sm_messageBody(self));
+            sm_refreshDeletedLooks();
+            return;
+        }
     }
     ((void (*)(id, SEL, NSUInteger))orig_setStatus)(self, _cmd, status);
 }
@@ -1062,9 +1069,9 @@ static void swizzled_deletePks(id self, SEL _cmd, id pks, BOOL deleteForAll, id 
         g_keepingDelete = YES;
         sm_noteDeletedPayload(pks, nil, self);
         g_keepingDelete = NO;
-        return;
     }
-    ((void (*)(id, SEL, id, BOOL, id))orig_deletePks)(self, _cmd, pks, deleteForAll, tasks);
+    if (orig_deletePks) ((void (*)(id, SEL, id, BOOL, id))orig_deletePks)(self, _cmd, pks, deleteForAll, tasks);
+    if (keepDeleted()) sm_scheduleRewrite(self);
 }
 
 static void swizzled_deleteComplaint(id self, SEL _cmd, id pks, BOOL deleteForAll, id complaint) {
@@ -1072,9 +1079,9 @@ static void swizzled_deleteComplaint(id self, SEL _cmd, id pks, BOOL deleteForAl
         g_keepingDelete = YES;
         sm_noteDeletedPayload(pks, nil, self);
         g_keepingDelete = NO;
-        return;
     }
-    ((void (*)(id, SEL, id, BOOL, id))orig_deleteComplaint)(self, _cmd, pks, deleteForAll, complaint);
+    if (orig_deleteComplaint) ((void (*)(id, SEL, id, BOOL, id))orig_deleteComplaint)(self, _cmd, pks, deleteForAll, complaint);
+    if (keepDeleted()) sm_scheduleRewrite(self);
 }
 
 static void swizzled_deleteLegacy(id self, SEL _cmd, id pks, BOOL deleteForAll, id complaint) {
@@ -1082,9 +1089,9 @@ static void swizzled_deleteLegacy(id self, SEL _cmd, id pks, BOOL deleteForAll, 
         g_keepingDelete = YES;
         sm_noteDeletedPayload(pks, nil, self);
         g_keepingDelete = NO;
-        return;
     }
-    ((void (*)(id, SEL, id, BOOL, id))orig_deleteLegacy)(self, _cmd, pks, deleteForAll, complaint);
+    if (orig_deleteLegacy) ((void (*)(id, SEL, id, BOOL, id))orig_deleteLegacy)(self, _cmd, pks, deleteForAll, complaint);
+    if (keepDeleted()) sm_scheduleRewrite(self);
 }
 
 static void swizzled_deletePksPublic(id self, SEL _cmd, id pks, BOOL deleteForAll) {
@@ -1092,9 +1099,9 @@ static void swizzled_deletePksPublic(id self, SEL _cmd, id pks, BOOL deleteForAl
         g_keepingDelete = YES;
         sm_noteDeletedPayload(pks, nil, self);
         g_keepingDelete = NO;
-        return;
     }
-    ((void (*)(id, SEL, id, BOOL))orig_deletePksPublic)(self, _cmd, pks, deleteForAll);
+    if (orig_deletePksPublic) ((void (*)(id, SEL, id, BOOL))orig_deletePksPublic)(self, _cmd, pks, deleteForAll);
+    if (keepDeleted()) sm_scheduleRewrite(self);
 }
 static IMP orig_removeObject;
 static IMP orig_removeObjects;
@@ -1407,20 +1414,34 @@ static NSDictionary *sm_snapshot(id message) {
     if ([cpk isKindOfClass:[NSString class]] && [(NSString *)cpk length]) record[@"cpk"] = cpk;
     if (sender) record[@"sender"] = [sender isKindOfClass:[NSNumber class]] ? sender : @([sender longLongValue]);
     if (ts) record[@"ts"] = @(ts);
-    if (text.length) record[@"text"] = text;
+    if (text.length) record[@"text"] = [sm_withoutCross(text) stringByReplacingOccurrencesOfString:smDeletedMark withString:@""];
     id date = sm_call(message, "timestamp");
+    if (!ts && [date isKindOfClass:[NSDate class]]) {
+        ts = (long long)([(NSDate *)date timeIntervalSince1970] * 1000.0);
+        if (ts) record[@"ts"] = @(ts);
+    }
+    static NSDateFormatter *clockFmt;
+    static dispatch_once_t clockOnce;
+    dispatch_once(&clockOnce, ^{
+        clockFmt = [[NSDateFormatter alloc] init];
+        clockFmt.locale = [NSLocale localeWithLocaleIdentifier:@"ru_RU"];
+        clockFmt.timeZone = [NSTimeZone localTimeZone];
+    });
+    NSString *minute = nil;
+    id display = sm_call(message, "displayTime");
+    if ([display isKindOfClass:[NSString class]]) {
+        NSString *shown = [(NSString *)display stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (shown.length >= 4 && shown.length <= 8 && [shown containsString:@":"]) minute = shown;
+    }
     if ([date isKindOfClass:[NSDate class]]) {
-        static NSDateFormatter *clockFmt;
-        static dispatch_once_t clockOnce;
-        dispatch_once(&clockOnce, ^{
-            clockFmt = [[NSDateFormatter alloc] init];
-            clockFmt.locale = [NSLocale localeWithLocaleIdentifier:@"ru_RU"];
-            clockFmt.timeZone = [NSTimeZone localTimeZone];
-            clockFmt.dateFormat = @"HH:mm:ss";
-        });
+        clockFmt.dateFormat = @"HH:mm";
+        NSString *formatted = [clockFmt stringFromDate:(NSDate *)date];
+        if (!minute.length) minute = formatted;
+        clockFmt.dateFormat = @"HH:mm:ss";
         NSString *clock = [clockFmt stringFromDate:(NSDate *)date];
         if (clock.length) record[@"clock"] = clock;
     }
+    if (minute.length) record[@"minute"] = minute;
     if ([message respondsToSelector:@selector(my)]) {
         BOOL mine = ((BOOL (*)(id, SEL))objc_msgSend)(message, @selector(my));
         record[@"my"] = @(mine);
@@ -1470,31 +1491,8 @@ static void sm_rememberSnapshot(NSDictionary *snap) {
 }
 
 static BOOL sm_shouldKeepRow(id transaction, id key) {
-    if (!keepDeleted() || !key) return NO;
-    if (sm_isKeptKey(key)) return YES;
-    SEL fetch = @selector(objectForKey:inCollection:);
-    if (![transaction respondsToSelector:fetch]) return NO;
-    id existing = nil;
-    @try {
-        existing = ((id (*)(id, SEL, id, id))objc_msgSend)(transaction, fetch, key, @"messages");
-    } @catch (__unused NSException *exception) {
-        existing = nil;
-    }
-    if (!existing) return NO;
-    BOOL tombstone = NO;
-    if (orig_status && smMessageClass && [existing isKindOfClass:smMessageClass]) {
-        NSUInteger raw = ((NSUInteger (*)(id, SEL))orig_status)(existing, @selector(status));
-        if (raw == 2) tombstone = YES;
-    }
-    NSDictionary *snap = sm_snapshot(existing);
-    long long sidValue = 0;
-    if ([snap[@"sid"] respondsToSelector:@selector(longLongValue)]) sidValue = [snap[@"sid"] longLongValue];
-    if (!tombstone && sidValue == 0) return NO;
-    if (tombstone || g_keepingDelete) {
-        if (snap) sm_rememberSnapshot(snap);
-        sm_prefixDeletedMark(existing);
-    }
-    return YES;
+    (void)transaction;
+    return keepDeleted() && sm_isKeptKey(key);
 }
 
 typedef struct {
@@ -1527,6 +1525,9 @@ static void sm_lookup_invoke(void *block, id transaction) {
             }
             if (!message && [item isKindOfClass:[NSString class]] && [transaction respondsToSelector:byPk]) {
                 message = ((id (*)(id, SEL, id))objc_msgSend)(transaction, byPk, item);
+            }
+            if (!message && [item isKindOfClass:[NSString class]] && [transaction respondsToSelector:@selector(objectForKey:inCollection:)]) {
+                message = ((id (*)(id, SEL, id, id))objc_msgSend)(transaction, @selector(objectForKey:inCollection:), item, @"messages");
             }
             NSDictionary *snap = sm_snapshot(message);
             if (message) [g_lookupMessages addObject:message];
@@ -1562,13 +1563,49 @@ static id sm_readBlock(void) {
 
 static id g_writeMessage;
 static id g_writeKey;
+static id g_writeChat;
+static id g_writeUserId;
+static id smChatService;
+static NSMutableArray *smRewriteMessages;
+static id smRewriteOwner;
+static BOOL smRewriteScheduled;
+static char smChatAssoc;
 
 static void sm_write_invoke(void *block, id transaction) {
     (void)block;
     if (!g_writeMessage || !g_writeKey) return;
-    SEL sel = @selector(setObject:forKey:inCollection:);
-    if (![transaction respondsToSelector:sel]) return;
-    ((void (*)(id, SEL, id, id, id))objc_msgSend)(transaction, sel, g_writeMessage, g_writeKey, @"messages");
+    SEL setSel = @selector(setObject:forKey:inCollection:);
+    if ([transaction respondsToSelector:setSel]) {
+        ((void (*)(id, SEL, id, id, id))objc_msgSend)(transaction, setSel, g_writeMessage, g_writeKey, @"messages");
+    }
+    SEL save = sel_registerName("okm_saveMessage:");
+    if ([transaction respondsToSelector:save]) {
+        @try {
+            ((void (*)(id, SEL, id))objc_msgSend)(transaction, save, g_writeMessage);
+        } @catch (__unused NSException *exception) {
+        }
+    }
+    id chat = g_writeChat;
+    const char *chatName = chat ? class_getName(object_getClass(chat)) : NULL;
+    if (!chatName || !strstr(chatName, "OKMChat")) chat = nil;
+    if (!chat) {
+        id cid = sm_call(g_writeMessage, "chatId");
+        SEL byId = sel_registerName("okm_chatForChatId:");
+        if (cid && [transaction respondsToSelector:byId]) {
+            @try {
+                chat = ((id (*)(id, SEL, id))objc_msgSend)(transaction, byId, cid);
+            } @catch (__unused NSException *exception) {
+                chat = nil;
+            }
+        }
+    }
+    SEL chunk = sel_registerName("okm_saveMessageInChunk:inChat:currentUserId:");
+    if (chat && [transaction respondsToSelector:chunk]) {
+        @try {
+            ((id (*)(id, SEL, id, id, id))objc_msgSend)(transaction, chunk, g_writeMessage, chat, g_writeUserId);
+        } @catch (__unused NSException *exception) {
+        }
+    }
 }
 
 static id sm_writeBlock(void) {
@@ -1596,6 +1633,57 @@ static char smKeptFlag;
 static void sm_prefixDeletedMark(id message) {
     if (!message) return;
     objc_setAssociatedObject(message, &smKeptFlag, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (smMessageClass && ![message isKindOfClass:smMessageClass] && ![message respondsToSelector:@selector(messageText)]) return;
+    id messageText = sm_call(message, "messageText");
+    NSString *text = nil;
+    Ivar ivar = sm_textIvar(messageText, &text);
+    if (text.length == 0) text = sm_messageBody(message);
+    if (text.length == 0) return;
+    NSString *clean = [[sm_withoutCross(text) stringByReplacingOccurrencesOfString:smDeletedMark withString:@""] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (clean.length == 0 || [text rangeOfString:smDeletedMark].location != NSNotFound) return;
+    NSString *marked = [smDeletedMark stringByAppendingString:clean];
+    if (messageText && [messageText respondsToSelector:@selector(setText:)]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(messageText, @selector(setText:), marked);
+    } else if (ivar && messageText) {
+        object_setIvar(messageText, ivar, marked);
+    }
+}
+
+static void sm_holdMessage(id message, id chat) {
+    if (!message) return;
+    if (!smRewriteMessages) smRewriteMessages = [NSMutableArray array];
+    const char *chatName = chat ? class_getName(object_getClass(chat)) : NULL;
+    if (chatName && strstr(chatName, "OKMChat")) {
+        objc_setAssociatedObject(message, &smChatAssoc, chat, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    if (![smRewriteMessages containsObject:message]) [smRewriteMessages addObject:message];
+    while (smRewriteMessages.count > 40) [smRewriteMessages removeObjectAtIndex:0];
+}
+
+static id sm_currentUserId(id owner) {
+    id service = owner;
+    if (service && ![service respondsToSelector:@selector(messengerCredentials)]) {
+        id inner = sm_call(service, "chatService");
+        if (inner) service = inner;
+    }
+    if (!service) service = smChatService;
+    if (service && [service respondsToSelector:@selector(messengerCredentials)]) smChatService = service;
+    id creds = sm_call(service, "messengerCredentials");
+    id uid = sm_call(creds, "currentUserId");
+    if (uid) g_writeUserId = uid;
+    return uid ?: g_writeUserId;
+}
+
+static id sm_writeConnection(id serviceOwner) {
+    id conn = sm_call(serviceOwner, "writeConnection");
+    if (!conn) {
+        id service = sm_call(serviceOwner, "chatService");
+        if (!service) service = smChatService;
+        conn = sm_call(service, "writeConnection");
+        if (!conn) conn = sm_call(service, "readConnection");
+    }
+    if (!conn) conn = sm_readConnection(serviceOwner);
+    return conn;
 }
 
 static void sm_writeMarkedMessage(id connection, id message) {
@@ -1604,14 +1692,18 @@ static void sm_writeMarkedMessage(id connection, id message) {
     if (![key isKindOfClass:[NSString class]] || ![key length]) return;
     id block = sm_writeBlock();
     if (!block || ![connection respondsToSelector:@selector(readWriteWithBlock:)]) return;
+    if (orig_setStatus) ((void (*)(id, SEL, NSUInteger))orig_setStatus)(message, @selector(setStatus:), 0);
+    sm_prefixDeletedMark(message);
     g_writeMessage = message;
     g_writeKey = key;
+    g_writeChat = objc_getAssociatedObject(message, &smChatAssoc);
     @try {
         ((void (*)(id, SEL, id))objc_msgSend)(connection, @selector(readWriteWithBlock:), block);
     } @catch (__unused NSException *exception) {
     }
     g_writeMessage = nil;
     g_writeKey = nil;
+    g_writeChat = nil;
 }
 
 static void sm_reloadView(UIView *view) {
@@ -1641,6 +1733,36 @@ static id sm_readConnection(id serviceOwner) {
     return conn;
 }
 
+static void sm_rewriteAll(id owner) {
+    NSArray *messages = [smRewriteMessages copy];
+    if (messages.count == 0) return;
+    id conn = sm_writeConnection(owner ?: smRewriteOwner);
+    g_writeUserId = sm_currentUserId(owner ?: smRewriteOwner);
+    for (id message in messages) {
+        sm_prefixDeletedMark(message);
+        NSDictionary *snap = sm_snapshot(message);
+        if (snap) sm_rememberSnapshot(snap);
+        sm_writeMarkedMessage(conn, message);
+    }
+}
+
+static void sm_scheduleRewrite(id owner) {
+    if (owner) smRewriteOwner = owner;
+    if (smRewriteScheduled) return;
+    smRewriteScheduled = YES;
+    id ownerKeep = smRewriteOwner;
+    void (^fire)(void) = ^{
+        sm_rewriteAll(ownerKeep);
+    };
+    dispatch_async(dispatch_get_main_queue(), fire);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)), dispatch_get_main_queue(), fire);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), fire);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        sm_rewriteAll(ownerKeep);
+        smRewriteScheduled = NO;
+    });
+}
+
 static void sm_noteDeletedPayload(id ids, id chat, id serviceOwner) {
     NSMutableArray *items = [NSMutableArray array];
     if ([ids isKindOfClass:[NSArray class]] || [ids isKindOfClass:[NSSet class]] || [ids isKindOfClass:[NSOrderedSet class]]) {
@@ -1651,6 +1773,7 @@ static void sm_noteDeletedPayload(id ids, id chat, id serviceOwner) {
     if (items.count == 0) return;
     for (id item in items) {
         if (smMessageClass && [item isKindOfClass:smMessageClass]) {
+            sm_holdMessage(item, chat);
             sm_prefixDeletedMark(item);
             NSDictionary *snap = sm_snapshot(item);
             if (snap) sm_rememberSnapshot(snap);
@@ -1711,10 +1834,14 @@ static void sm_noteDeletedPayload(id ids, id chat, id serviceOwner) {
         sm_rememberSnapshot(rich);
     }
     for (id message in messages) {
+        sm_holdMessage(message, chatRef);
         sm_prefixDeletedMark(message);
-        sm_writeMarkedMessage(connection, message);
+        sm_writeMarkedMessage(sm_writeConnection(serviceOwner), message);
     }
-    if (snaps.count || messages.count) sm_reloadHistory();
+    if (messages.count || snaps.count) {
+        sm_scheduleRewrite(serviceOwner);
+        sm_reloadHistory();
+    }
 }
 
 static BOOL sm_sameChat(NSDictionary *rec, id sample) {
@@ -1843,9 +1970,12 @@ static id sm_mergeKeptInto(id page, id messages) {
         if (pk.length && [seen containsObject:pk]) continue;
         if (sid && [seen containsObject:[NSString stringWithFormat:@"sid:%lld", sid]]) continue;
         long long ts = [rec[@"ts"] longLongValue];
+        long long scale = (llabs(ts) > 100000000000LL || llabs(maxTs) > 100000000000LL) ? 1000LL : 1LL;
+        long long slack = 30LL * 60LL * scale;
         BOOL inRange = ts && minTs != LLONG_MAX && ts >= minTs && ts <= maxTs;
+        BOOL newer = ts && maxTs != LLONG_MIN && ts > maxTs && (lastPage || (ts - maxTs) <= slack);
         BOOL tail = lastPage && ts && (maxTs == LLONG_MIN || ts > maxTs);
-        if (!inRange && !tail) continue;
+        if (!inRange && !newer && !tail) continue;
         id made = sm_makeMessage(rec);
         if (!made) continue;
         [extra addObject:made];
@@ -1921,9 +2051,30 @@ static NSString *sm_messageBody(id message) {
     return direct;
 }
 
+static NSString *sm_layerText(CALayer *layer, int depth) {
+    if (!layer || depth > 4) return nil;
+    if ([layer isKindOfClass:[CATextLayer class]]) {
+        id value = ((CATextLayer *)layer).string;
+        if ([value isKindOfClass:[NSString class]] && [(NSString *)value length]) return value;
+        if ([value isKindOfClass:[NSAttributedString class]]) {
+            NSString *string = ((NSAttributedString *)value).string;
+            if (string.length) return string;
+        }
+    }
+    for (CALayer *sublayer in layer.sublayers) {
+        NSString *string = sm_layerText(sublayer, depth + 1);
+        if (string.length) return string;
+    }
+    return nil;
+}
+
 static NSString *sm_viewText(UIView *view) {
     if (view.tag == kDeletedBadgeTag) return nil;
-    if ([view isKindOfClass:[UILabel class]]) return ((UILabel *)view).text;
+    if ([view isKindOfClass:[UILabel class]]) {
+        UILabel *label = (UILabel *)view;
+        if (label.text.length) return label.text;
+        if (label.attributedText.string.length) return label.attributedText.string;
+    }
     if ([view isKindOfClass:[UITextView class]]) return ((UITextView *)view).text;
     if ([view respondsToSelector:@selector(attributedText)]) {
         id attr = ((id (*)(id, SEL))objc_msgSend)(view, @selector(attributedText));
@@ -1935,23 +2086,25 @@ static NSString *sm_viewText(UIView *view) {
     if ([view respondsToSelector:@selector(text)]) {
         id text = ((id (*)(id, SEL))objc_msgSend)(view, @selector(text));
         if ([text isKindOfClass:[NSString class]] && [text length]) return text;
+        if ([text isKindOfClass:[NSAttributedString class]]) {
+            NSString *string = ((NSAttributedString *)text).string;
+            if (string.length) return string;
+        }
     }
-    const char *name = class_getName(object_getClass(view));
     NSString *ivarText = nil;
     sm_textIvar(view, &ivarText);
     if (ivarText.length) return ivarText;
-    if (name && (strstr(name, "Text") || strstr(name, "Label") || strstr(name, "Message"))) {
-        return nil;
-    }
-    return nil;
+    return sm_layerText(view.layer, 0);
 }
+
+static BOOL smClockCounts = YES;
 
 static BOOL sm_labelIsKeptClock(NSString *text);
 
 static BOOL sm_treeHasDeletedText(UIView *view) {
     NSString *text = sm_viewText(view);
-    if (sm_isDeletedBody(text) || sm_labelIsKeptClock(text)) return YES;
-    if (view.tag != kDeletedBadgeTag && (sm_isDeletedBody(view.accessibilityLabel) || sm_labelIsKeptClock(view.accessibilityLabel))) return YES;
+    if (sm_isDeletedBody(text) || (smClockCounts && sm_labelIsKeptClock(text))) return YES;
+    if (view.tag != kDeletedBadgeTag && (sm_isDeletedBody(view.accessibilityLabel) || (smClockCounts && sm_labelIsKeptClock(view.accessibilityLabel)))) return YES;
     for (UIView *subview in view.subviews) {
         if (sm_treeHasDeletedText(subview)) return YES;
     }
@@ -2019,33 +2172,78 @@ static BOOL sm_keyIsKept(id key) {
     return sm_isKeptKey(pk) || sm_isKeptServerId(pk);
 }
 
-static BOOL sm_labelIsKeptClock(NSString *text) {
-    if (text.length < 8) return NO;
-    NSString *probe = nil;
-    if (text.length == 8 && [text characterAtIndex:2] == ':' && [text characterAtIndex:5] == ':') probe = text;
-    if (!probe) {
-        for (NSUInteger i = 0; i + 8 <= text.length; i++) {
-            unichar a = [text characterAtIndex:i + 2];
-            unichar b = [text characterAtIndex:i + 5];
-            if (a == ':' && b == ':') {
-                probe = [text substringWithRange:NSMakeRange(i, 8)];
-                break;
-            }
-        }
+static BOOL sm_timeToken(NSString *text, NSString **outToken) {
+    if (text.length == 0 || text.length > 16) return NO;
+    NSString *token = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (token.length < 4 || token.length > 8) return NO;
+    NSUInteger colons = 0;
+    for (NSUInteger i = 0; i < token.length; i++) {
+        unichar c = [token characterAtIndex:i];
+        if (c == ':') colons++;
+        else if (c < '0' || c > '9') return NO;
     }
-    if (probe.length != 8) return NO;
+    if (colons < 1 || colons > 2) return NO;
+    if (outToken) *outToken = token;
+    return YES;
+}
+
+static BOOL sm_labelIsKeptClock(NSString *text) {
+    NSString *token = nil;
+    if (!sm_timeToken(text, &token)) return NO;
     sm_loadDeletedBodies();
     [smDeletedLock lock];
     BOOL hit = NO;
     for (NSDictionary *rec in smKept) {
+        NSString *minute = [rec[@"minute"] isKindOfClass:[NSString class]] ? rec[@"minute"] : nil;
         NSString *clock = [rec[@"clock"] isKindOfClass:[NSString class]] ? rec[@"clock"] : nil;
-        if (clock.length && [clock isEqualToString:probe]) {
-            hit = YES;
-            break;
-        }
+        if (minute.length && [minute isEqualToString:token]) { hit = YES; break; }
+        if (clock.length && [clock isEqualToString:token]) { hit = YES; break; }
+        if (clock.length >= 5 && token.length == 5 && [clock hasPrefix:token]) { hit = YES; break; }
     }
     [smDeletedLock unlock];
     return hit;
+}
+
+static NSString *sm_shownMinute(UIView *view) {
+    NSString *token = nil;
+    if (sm_timeToken(sm_viewText(view), &token) && sm_labelIsKeptClock(token)) return token;
+    if (sm_timeToken(view.accessibilityLabel, &token) && sm_labelIsKeptClock(token)) return token;
+    for (UIView *subview in view.subviews) {
+        if (subview.tag == kDeletedBadgeTag) continue;
+        NSString *found = sm_shownMinute(subview);
+        if (found.length) return found;
+    }
+    return nil;
+}
+
+static NSUInteger sm_cellsShowingMinute(UIView *from, NSString *minute) {
+    if (minute.length == 0) return 0;
+    UIWindow *window = from.window;
+    if (!window) return 1;
+    NSUInteger count = 0;
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:window];
+    while (stack.count) {
+        UIView *view = stack.lastObject;
+        [stack removeLastObject];
+        if (sm_isHistoryMessageCell(view)) {
+            NSString *shown = sm_shownMinute(view);
+            if (shown && [shown isEqualToString:minute]) count++;
+            continue;
+        }
+        for (UIView *subview in view.subviews) [stack addObject:subview];
+    }
+    return count;
+}
+
+static UIView *sm_minuteView(UIView *view, NSString *minute) {
+    NSString *token = nil;
+    if (sm_timeToken(sm_viewText(view), &token) && (!minute.length || [token isEqualToString:minute])) return view;
+    for (UIView *subview in view.subviews) {
+        if (subview.tag == kDeletedBadgeTag) continue;
+        UIView *found = sm_minuteView(subview, minute);
+        if (found) return found;
+    }
+    return nil;
 }
 
 static BOOL sm_allowBareIvar(const char *name) {
@@ -2170,7 +2368,15 @@ static void sm_updateDeletedCell(UIView *cell) {
     static BOOL busy;
     if (busy) return;
     busy = YES;
-    BOOL deleted = keepDeleted() && (objc_getAssociatedObject(cell, &smCellMark) != nil || sm_treeHasDeletedText(cell) || sm_viewOwnsDeleted(cell));
+    smClockCounts = NO;
+    BOOL body = sm_treeHasDeletedText(cell);
+    smClockCounts = YES;
+    BOOL timed = sm_treeHasDeletedText(cell);
+    BOOL owned = sm_viewOwnsDeleted(cell);
+    NSString *minute = sm_shownMinute(cell);
+    BOOL clockOnly = timed && !body && !owned;
+    if (clockOnly && minute.length && sm_cellsShowingMinute(cell, minute) > 1) timed = NO;
+    BOOL deleted = keepDeleted() && (objc_getAssociatedObject(cell, &smCellMark) != nil || owned || body || timed);
     UIView *bubble = sm_namedView(cell, "bubbleView");
     if (!bubble) bubble = sm_findClassView(cell, "BubbleView");
     if (!bubble) bubble = sm_messageBubble(cell);
@@ -2182,7 +2388,7 @@ static void sm_updateDeletedCell(UIView *cell) {
         return;
     }
     objc_setAssociatedObject(cell, &smCellMark, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    if (bubble) bubble.alpha = 0.55;
+    if (bubble) bubble.alpha = 0.58;
     sm_stripCrossViews(cell);
     UIImageView *badge = [existing isKindOfClass:[UIImageView class]] ? (UIImageView *)existing : nil;
     if (!badge) {
@@ -2194,17 +2400,21 @@ static void sm_updateDeletedCell(UIView *cell) {
         badge.image = [[UIImage systemImageNamed:@"trash"] imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
         [cell addSubview:badge];
     }
-    UIView *timeView = sm_findClassView(cell, "MessageTimeAndStatusView");
-    CGFloat side = 13;
+    UIView *timeAnchor = minute.length ? sm_minuteView(cell, minute) : sm_minuteView(cell, nil);
+    if (!timeAnchor) timeAnchor = sm_findClassView(cell, "MessageTimeAndStatusView");
+    CGFloat side = 12;
     UIColor *tint = [UIColor colorWithWhite:1 alpha:0.92];
     CGRect frame;
-    if (timeView && !CGRectIsEmpty(timeView.bounds)) {
-        CGRect timeFrame = [timeView convertRect:timeView.bounds toView:cell];
-        side = MIN(14, MAX(11, CGRectGetHeight(timeFrame) * 0.72));
-        frame = CGRectMake(CGRectGetMinX(timeFrame) - side - 3, CGRectGetMidY(timeFrame) - side / 2.0, side, side);
+    if (timeAnchor && !CGRectIsEmpty(timeAnchor.bounds)) {
+        CGRect timeFrame = [timeAnchor convertRect:timeAnchor.bounds toView:cell];
+        side = MIN(13, MAX(10, CGRectGetHeight(timeFrame) * 0.9));
+        if ([timeAnchor isKindOfClass:[UILabel class]] && ((UILabel *)timeAnchor).textColor) {
+            tint = [((UILabel *)timeAnchor).textColor colorWithAlphaComponent:0.95];
+        }
+        frame = CGRectMake(CGRectGetMinX(timeFrame) - side - 2, CGRectGetMidY(timeFrame) - side / 2.0, side, side);
     } else {
         CGRect bubbleFrame = bubble ? [bubble convertRect:bubble.bounds toView:cell] : CGRectInset(cell.bounds, 12, 8);
-        frame = CGRectMake(CGRectGetMaxX(bubbleFrame) - 72, CGRectGetMaxY(bubbleFrame) - side - 8, side, side);
+        frame = CGRectMake(CGRectGetMaxX(bubbleFrame) - 70, CGRectGetMaxY(bubbleFrame) - side - 7, side, side);
     }
     if (CGRectGetMinX(frame) < 1) frame.origin.x = 1;
     badge.tintColor = tint;
@@ -2417,8 +2627,6 @@ static void sm_deliver(NSString *title, NSString *body) {
     UNNotificationRequest *request = [UNNotificationRequest requestWithIdentifier:identifier content:content trigger:nil];
     [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:request withCompletionHandler:nil];
 }
-
-static id smChatService;
 
 static id sm_chatServiceFrom(id owner) {
     id service = sm_call(owner, "chatService");
