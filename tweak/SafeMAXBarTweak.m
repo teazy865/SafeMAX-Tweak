@@ -973,12 +973,17 @@ static NSString *sm_messageBody(id message);
 static void sm_refreshDeletedLooks(void);
 static void sm_updateDeletedCell(UIView *cell);
 static NSDictionary *sm_snapshot(id message);
+static void sm_prefixDeletedMark(id message);
 static void sm_rememberSnapshot(NSDictionary *snap);
 static void sm_noteHistoryPage(id value);
 
+static BOOL g_keepingDelete;
+
 static id swizzled_deleteLocal(id self, SEL _cmd, id messageIds, id chat) {
     if (keepDeleted()) {
+        g_keepingDelete = YES;
         sm_noteDeletedPayload(messageIds, chat, self);
+        g_keepingDelete = NO;
         return nil;
     }
     return ((id (*)(id, SEL, id, id))orig_deleteLocal)(self, _cmd, messageIds, chat);
@@ -1003,7 +1008,9 @@ static NSUInteger swizzled_status(id self, SEL _cmd) {
 
 static void swizzled_messagesDeleted(id self, SEL _cmd, id messages, id chat) {
     if (keepDeleted()) {
+        g_keepingDelete = YES;
         sm_noteDeletedPayload(messages, chat, self);
+        g_keepingDelete = NO;
         return;
     }
     ((void (*)(id, SEL, id, id))orig_messagesDeleted)(self, _cmd, messages, chat);
@@ -1011,9 +1018,11 @@ static void swizzled_messagesDeleted(id self, SEL _cmd, id messages, id chat) {
 
 static void swizzled_delayedDeleted(id self, SEL _cmd, id notification) {
     if (keepDeleted()) {
+        g_keepingDelete = YES;
         id ids = [notification respondsToSelector:@selector(messageIds)] ? ((id (*)(id, SEL))objc_msgSend)(notification, @selector(messageIds)) : notification;
         id chat = [notification respondsToSelector:@selector(chat)] ? ((id (*)(id, SEL))objc_msgSend)(notification, @selector(chat)) : nil;
         sm_noteDeletedPayload(ids, chat, self);
+        g_keepingDelete = NO;
         return;
     }
     ((void (*)(id, SEL, id))orig_delayedDeleted)(self, _cmd, notification);
@@ -1045,47 +1054,95 @@ static void swizzled_sendNextPass(id self, SEL _cmd, id value) {
 
 static IMP orig_deletePks;
 static IMP orig_deletePksPublic;
+static IMP orig_deleteComplaint;
+static IMP orig_deleteLegacy;
 
 static void swizzled_deletePks(id self, SEL _cmd, id pks, BOOL deleteForAll, id tasks) {
     if (keepDeleted()) {
+        g_keepingDelete = YES;
         sm_noteDeletedPayload(pks, nil, self);
+        g_keepingDelete = NO;
         return;
     }
     ((void (*)(id, SEL, id, BOOL, id))orig_deletePks)(self, _cmd, pks, deleteForAll, tasks);
 }
 
+static void swizzled_deleteComplaint(id self, SEL _cmd, id pks, BOOL deleteForAll, id complaint) {
+    if (keepDeleted()) {
+        g_keepingDelete = YES;
+        sm_noteDeletedPayload(pks, nil, self);
+        g_keepingDelete = NO;
+        return;
+    }
+    ((void (*)(id, SEL, id, BOOL, id))orig_deleteComplaint)(self, _cmd, pks, deleteForAll, complaint);
+}
+
+static void swizzled_deleteLegacy(id self, SEL _cmd, id pks, BOOL deleteForAll, id complaint) {
+    if (keepDeleted()) {
+        g_keepingDelete = YES;
+        sm_noteDeletedPayload(pks, nil, self);
+        g_keepingDelete = NO;
+        return;
+    }
+    ((void (*)(id, SEL, id, BOOL, id))orig_deleteLegacy)(self, _cmd, pks, deleteForAll, complaint);
+}
+
 static void swizzled_deletePksPublic(id self, SEL _cmd, id pks, BOOL deleteForAll) {
     if (keepDeleted()) {
+        g_keepingDelete = YES;
         sm_noteDeletedPayload(pks, nil, self);
+        g_keepingDelete = NO;
         return;
     }
     ((void (*)(id, SEL, id, BOOL))orig_deletePksPublic)(self, _cmd, pks, deleteForAll);
 }
 static IMP orig_removeObject;
 static IMP orig_removeObjects;
+static IMP orig_removeWithRowid;
+static IMP orig_removeCollectionKey;
 static IMP orig_setDbObject;
 static IMP orig_setMessages;
 static IMP orig_getMessages;
 static BOOL g_inMerge;
 static char smMergedSourceKey;
 static char smMergedValueKey;
+static char smCellMark;
 
 static BOOL sm_isMessagesCollection(id collection) {
     return [collection isKindOfClass:[NSString class]] && [(NSString *)collection isEqualToString:@"messages"];
 }
 
 static BOOL sm_isKeptKey(id key);
+static BOOL sm_shouldKeepRow(id transaction, id key);
 
 static void swizzled_removeObject(id self, SEL _cmd, id key, id collection) {
-    if (keepDeleted() && sm_isMessagesCollection(collection) && sm_isKeptKey(key)) return;
+    if (keepDeleted() && sm_isMessagesCollection(collection) && sm_shouldKeepRow(self, key)) return;
     ((void (*)(id, SEL, id, id))orig_removeObject)(self, _cmd, key, collection);
+}
+
+static void swizzled_removeWithRowid(id self, SEL _cmd, id key, id collection, long long rowid) {
+    if (keepDeleted() && sm_isMessagesCollection(collection) && sm_shouldKeepRow(self, key)) return;
+    ((void (*)(id, SEL, id, id, long long))orig_removeWithRowid)(self, _cmd, key, collection, rowid);
+}
+
+static void swizzled_removeCollectionKey(id self, SEL _cmd, id collectionKey, long long rowid) {
+    if (keepDeleted() && collectionKey) {
+        id collection = nil;
+        id key = nil;
+        SEL collectionSel = sel_registerName("collection");
+        SEL keySel = sel_registerName("key");
+        if ([collectionKey respondsToSelector:collectionSel]) collection = ((id (*)(id, SEL))objc_msgSend)(collectionKey, collectionSel);
+        if ([collectionKey respondsToSelector:keySel]) key = ((id (*)(id, SEL))objc_msgSend)(collectionKey, keySel);
+        if (sm_isMessagesCollection(collection) && sm_shouldKeepRow(self, key)) return;
+    }
+    ((void (*)(id, SEL, id, long long))orig_removeCollectionKey)(self, _cmd, collectionKey, rowid);
 }
 
 static void swizzled_removeObjects(id self, SEL _cmd, id keys, id collection) {
     if (keepDeleted() && sm_isMessagesCollection(collection) && [keys respondsToSelector:@selector(countByEnumeratingWithState:objects:count:)]) {
         NSMutableArray *rest = [NSMutableArray array];
         for (id key in keys) {
-            if (!sm_isKeptKey(key)) [rest addObject:key];
+            if (!sm_shouldKeepRow(self, key)) [rest addObject:key];
         }
         if (rest.count == 0) return;
         keys = rest;
@@ -1094,12 +1151,14 @@ static void swizzled_removeObjects(id self, SEL _cmd, id keys, id collection) {
 }
 
 static void swizzled_setDbObject(id self, SEL _cmd, id object, id key, id collection) {
-    if (keepDeleted() && sm_isMessagesCollection(collection) && sm_isKeptKey(key)) {
-        if (!object) return;
-        if (orig_status && smMessageClass && [object isKindOfClass:smMessageClass]) {
+    if (keepDeleted() && sm_isMessagesCollection(collection)) {
+        BOOL tombstone = NO;
+        if (!object) tombstone = YES;
+        else if (orig_status && smMessageClass && [object isKindOfClass:smMessageClass]) {
             NSUInteger raw = ((NSUInteger (*)(id, SEL))orig_status)(object, @selector(status));
-            if (raw == 2) return;
+            if (raw == 2) tombstone = YES;
         }
+        if (tombstone && sm_shouldKeepRow(self, key)) return;
     }
     ((void (*)(id, SEL, id, id, id))orig_setDbObject)(self, _cmd, object, key, collection);
 }
@@ -1136,6 +1195,10 @@ static void swizzled_setMessages(id self, SEL _cmd, id messages) {
     ((void (*)(id, SEL, id))orig_setMessages)(self, _cmd, messages);
 }
 
+static void swizzled_bubbleLayout(id self, SEL _cmd);
+static void swizzled_gradientLayout(id self, SEL _cmd);
+static void swizzled_prepareReuse(id self, SEL _cmd);
+
 static void hookKeepDeleted(void) {
     if (!smMessageClass) smMessageClass = objc_getClass("OKMMessage");
     sm_hook_own(smMessageClass, "setStatus:", (IMP)swizzled_setStatus, &orig_setStatus);
@@ -1143,6 +1206,8 @@ static void hookKeepDeleted(void) {
     sm_hook_own(objc_getClass("OKMChatService"), "deleteLocallyMessagesWithIds:updateChat:", (IMP)swizzled_deleteLocal, &orig_deleteLocal);
     sm_hook_own(objc_getClass("OKMChatService"), "deleteMessagesWithPks:deleteForAll:", (IMP)swizzled_deletePksPublic, &orig_deletePksPublic);
     sm_hook_own(objc_getClass("OKMChatService"), "_deleteMessagesWithPks:deleteForAll:enqueueTasks:", (IMP)swizzled_deletePks, &orig_deletePks);
+    sm_hook_own(objc_getClass("OKMChatService"), "_deleteMessagesWithPks:deleteForAll:withComplaint:", (IMP)swizzled_deleteComplaint, &orig_deleteComplaint);
+    sm_hook_own(objc_getClass("OKMChatService"), "_deleteMessagesWithPks:deleteForAll:withLegacyComplaint:", (IMP)swizzled_deleteLegacy, &orig_deleteLegacy);
     Class listener = objc_getClass("OKMMessageDeleteListener");
     sm_hook_own(listener, "_messagesDeleted:inChat:", (IMP)swizzled_messagesDeleted, &orig_messagesDeleted);
     sm_hook_own(listener, "_delayedMessagesDeleted:", (IMP)swizzled_delayedDeleted, &orig_delayedDeleted);
@@ -1152,11 +1217,16 @@ static void hookKeepDeleted(void) {
     sm_hook_own(objc_getClass("RACPassthroughSubscriber"), "sendNext:", (IMP)swizzled_sendNextPass, &orig_sendNextPass);
     Class writeTx = objc_getClass("YapDatabaseReadWriteTransaction");
     sm_hook_own(writeTx, "removeObjectForKey:inCollection:", (IMP)swizzled_removeObject, &orig_removeObject);
+    sm_hook_own(writeTx, "removeObjectForKey:inCollection:withRowid:", (IMP)swizzled_removeWithRowid, &orig_removeWithRowid);
+    sm_hook_own(writeTx, "removeObjectForCollectionKey:withRowid:", (IMP)swizzled_removeCollectionKey, &orig_removeCollectionKey);
     sm_hook_own(writeTx, "removeObjectsForKeys:inCollection:", (IMP)swizzled_removeObjects, &orig_removeObjects);
     sm_hook_own(writeTx, "setObject:forKey:inCollection:", (IMP)swizzled_setDbObject, &orig_setDbObject);
     Class pageClass = objc_getClass("OKMHistoryPage");
     sm_hook_own(pageClass, "setMessages:", (IMP)swizzled_setMessages, &orig_setMessages);
     sm_hook_own(pageClass, "messages", (IMP)swizzled_getMessages, &orig_getMessages);
+    sm_hook_own(objc_getClass("_TtC13ChatHistoryUI10BubbleView"), "layoutSubviews", (IMP)swizzled_bubbleLayout, &orig_bubbleLayout);
+    sm_hook_own(objc_getClass("_TtC13ChatHistoryUI18GradientBubbleView"), "layoutSubviews", (IMP)swizzled_gradientLayout, &orig_gradientLayout);
+    sm_hook_own(objc_getClass("_TtC13ChatHistoryUI11MessageCell"), "prepareForReuse", (IMP)swizzled_prepareReuse, &orig_prepareReuse);
 }
 
 static Ivar sm_textIvar(id text, NSString **value) {
@@ -1335,6 +1405,19 @@ static NSDictionary *sm_snapshot(id message) {
     if (sender) record[@"sender"] = [sender isKindOfClass:[NSNumber class]] ? sender : @([sender longLongValue]);
     if (ts) record[@"ts"] = @(ts);
     if (text.length) record[@"text"] = text;
+    id date = sm_call(message, "timestamp");
+    if ([date isKindOfClass:[NSDate class]]) {
+        static NSDateFormatter *clockFmt;
+        static dispatch_once_t clockOnce;
+        dispatch_once(&clockOnce, ^{
+            clockFmt = [[NSDateFormatter alloc] init];
+            clockFmt.locale = [NSLocale localeWithLocaleIdentifier:@"ru_RU"];
+            clockFmt.timeZone = [NSTimeZone localTimeZone];
+            clockFmt.dateFormat = @"HH:mm:ss";
+        });
+        NSString *clock = [clockFmt stringFromDate:(NSDate *)date];
+        if (clock.length) record[@"clock"] = clock;
+    }
     if ([message respondsToSelector:@selector(my)]) {
         BOOL mine = ((BOOL (*)(id, SEL))objc_msgSend)(message, @selector(my));
         record[@"my"] = @(mine);
@@ -1381,6 +1464,34 @@ static void sm_rememberSnapshot(NSDictionary *snap) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     [defaults setObject:stored forKey:@"SafeMAX_KeptMessages"];
     [defaults synchronize];
+}
+
+static BOOL sm_shouldKeepRow(id transaction, id key) {
+    if (!keepDeleted() || !key) return NO;
+    if (sm_isKeptKey(key)) return YES;
+    SEL fetch = @selector(objectForKey:inCollection:);
+    if (![transaction respondsToSelector:fetch]) return NO;
+    id existing = nil;
+    @try {
+        existing = ((id (*)(id, SEL, id, id))objc_msgSend)(transaction, fetch, key, @"messages");
+    } @catch (__unused NSException *exception) {
+        existing = nil;
+    }
+    if (!existing) return NO;
+    BOOL tombstone = NO;
+    if (orig_status && smMessageClass && [existing isKindOfClass:smMessageClass]) {
+        NSUInteger raw = ((NSUInteger (*)(id, SEL))orig_status)(existing, @selector(status));
+        if (raw == 2) tombstone = YES;
+    }
+    NSDictionary *snap = sm_snapshot(existing);
+    long long sidValue = 0;
+    if ([snap[@"sid"] respondsToSelector:@selector(longLongValue)]) sidValue = [snap[@"sid"] longLongValue];
+    if (!tombstone && sidValue == 0) return NO;
+    if (tombstone || g_keepingDelete) {
+        if (snap) sm_rememberSnapshot(snap);
+        sm_prefixDeletedMark(existing);
+    }
+    return YES;
 }
 
 typedef struct {
@@ -1832,9 +1943,12 @@ static NSString *sm_viewText(UIView *view) {
     return nil;
 }
 
+static BOOL sm_labelIsKeptClock(NSString *text);
+
 static BOOL sm_treeHasDeletedText(UIView *view) {
-    if (sm_isDeletedBody(sm_viewText(view))) return YES;
-    if (view.tag != kDeletedBadgeTag && sm_isDeletedBody(view.accessibilityLabel)) return YES;
+    NSString *text = sm_viewText(view);
+    if (sm_isDeletedBody(text) || sm_labelIsKeptClock(text)) return YES;
+    if (view.tag != kDeletedBadgeTag && (sm_isDeletedBody(view.accessibilityLabel) || sm_labelIsKeptClock(view.accessibilityLabel))) return YES;
     for (UIView *subview in view.subviews) {
         if (sm_treeHasDeletedText(subview)) return YES;
     }
@@ -1902,7 +2016,79 @@ static BOOL sm_keyIsKept(id key) {
     return sm_isKeptKey(pk) || sm_isKeptServerId(pk);
 }
 
+static BOOL sm_labelIsKeptClock(NSString *text) {
+    if (text.length < 8) return NO;
+    NSString *probe = nil;
+    if (text.length == 8 && [text characterAtIndex:2] == ':' && [text characterAtIndex:5] == ':') probe = text;
+    if (!probe) {
+        for (NSUInteger i = 0; i + 8 <= text.length; i++) {
+            unichar a = [text characterAtIndex:i + 2];
+            unichar b = [text characterAtIndex:i + 5];
+            if (a == ':' && b == ':') {
+                probe = [text substringWithRange:NSMakeRange(i, 8)];
+                break;
+            }
+        }
+    }
+    if (probe.length != 8) return NO;
+    sm_loadDeletedBodies();
+    [smDeletedLock lock];
+    BOOL hit = NO;
+    for (NSDictionary *rec in smKept) {
+        NSString *clock = [rec[@"clock"] isKindOfClass:[NSString class]] ? rec[@"clock"] : nil;
+        if (clock.length && [clock isEqualToString:probe]) {
+            hit = YES;
+            break;
+        }
+    }
+    [smDeletedLock unlock];
+    return hit;
+}
+
+static BOOL sm_allowBareIvar(const char *name) {
+    if (!name) return NO;
+    return strcmp(name, "viewModel") == 0 || strcmp(name, "contentsView") == 0 || strcmp(name, "bubbleView") == 0 ||
+           strcmp(name, "lazyTextView") == 0 || strcmp(name, "lazyTimeAndStatusView") == 0 ||
+           strcmp(name, "timeView") == 0 || strcmp(name, "statusView") == 0 ||
+           strcmp(name, "supplementaryContentsView") == 0 || strcmp(name, "mainViewContainerView") == 0 ||
+           strcmp(name, "supplementaryView") == 0 || strcmp(name, "highlightView") == 0;
+}
+
+static id sm_readIvarObject(id object, Ivar ivar) {
+    if (!object || !ivar) return nil;
+    const char *type = ivar_getTypeEncoding(ivar);
+    const char *name = ivar_getName(ivar);
+    if (!(type && type[0] == '@') && !sm_allowBareIvar(name)) return nil;
+    @try {
+        return object_getIvar(object, ivar);
+    } @catch (__unused NSException *exception) {
+        return nil;
+    }
+}
+
+static id sm_tryKey(id object, NSString *key) {
+    if (!object || key.length == 0) return nil;
+    SEL sel = NSSelectorFromString(key);
+    if (![object respondsToSelector:sel]) return nil;
+    @try {
+        return ((id (*)(id, SEL))objc_msgSend)(object, sel);
+    } @catch (__unused NSException *exception) {
+        return nil;
+    }
+}
+
 static BOOL sm_objectTreeKept(id object, int depth);
+
+static BOOL sm_valueKept(id value, int depth) {
+    if (!value || value == (id)kCFNull) return NO;
+    if ([value isKindOfClass:[NSString class]] || [value isKindOfClass:[NSAttributedString class]]) {
+        NSString *text = [value isKindOfClass:[NSString class]] ? (NSString *)value : ((NSAttributedString *)value).string;
+        return sm_isDeletedBody(text) || sm_labelIsKeptClock(text) || sm_isKeptKey(text);
+    }
+    if ([value isKindOfClass:[NSNumber class]]) return sm_isKeptServerId(value) || sm_isKeptKey(value);
+    if (sm_keyIsKept(value) || sm_objectIsDeletedMessage(value)) return YES;
+    return sm_objectTreeKept(value, depth);
+}
 
 static BOOL sm_viewOwnsDeleted(UIView *view) {
     if (sm_objectTreeKept(view, 0)) return YES;
@@ -1914,26 +2100,23 @@ static BOOL sm_viewOwnsDeleted(UIView *view) {
 }
 
 static BOOL sm_objectTreeKept(id object, int depth) {
-    if (!object || depth > 3 || [object isKindOfClass:[NSString class]] || [object isKindOfClass:[NSNumber class]]) return NO;
-    if (sm_keyIsKept(object) || sm_objectIsDeletedMessage(object)) return YES;
-    if ([object isKindOfClass:[UIView class]] && depth > 0) return NO;
+    if (!object || depth > 4) return NO;
+    if ([object isKindOfClass:[NSString class]] || [object isKindOfClass:[NSNumber class]] || [object isKindOfClass:[NSDate class]]) return NO;
+    if (depth > 0 && (sm_keyIsKept(object) || sm_objectIsDeletedMessage(object))) return YES;
+    if ([object isKindOfClass:[UIView class]] && depth > 1) return NO;
+    if (depth <= 1) {
+        for (NSString *key in @[@"viewModel", @"message", @"messagePk", @"messageId", @"primaryKey", @"serverId", @"text", @"body"]) {
+            if (sm_valueKept(sm_tryKey(object, key), depth + 1)) return YES;
+        }
+    }
     Class cls = object_getClass(object);
     while (cls && cls != [NSObject class]) {
         unsigned int count = 0;
         Ivar *ivars = class_copyIvarList(cls, &count);
         for (unsigned int i = 0; i < count; i++) {
-            const char *type = ivar_getTypeEncoding(ivars[i]);
-            if (!type || type[0] != '@') continue;
-            id value = object_getIvar(object, ivars[i]);
-            if ([value isKindOfClass:[NSString class]] || [value isKindOfClass:[NSAttributedString class]]) {
-                NSString *text = [value isKindOfClass:[NSString class]] ? value : ((NSAttributedString *)value).string;
-                if (sm_isDeletedBody(text)) {
-                    free(ivars);
-                    return YES;
-                }
-                continue;
-            }
-            if (sm_objectTreeKept(value, depth + 1)) {
+            id value = sm_readIvarObject(object, ivars[i]);
+            if (!value || value == object) continue;
+            if (sm_valueKept(value, depth + 1)) {
                 free(ivars);
                 return YES;
             }
@@ -1984,8 +2167,9 @@ static void sm_updateDeletedCell(UIView *cell) {
     static BOOL busy;
     if (busy) return;
     busy = YES;
-    BOOL deleted = keepDeleted() && (sm_treeHasDeletedText(cell) || sm_viewOwnsDeleted(cell));
+    BOOL deleted = keepDeleted() && (objc_getAssociatedObject(cell, &smCellMark) != nil || sm_treeHasDeletedText(cell) || sm_viewOwnsDeleted(cell));
     UIView *bubble = sm_namedView(cell, "bubbleView");
+    if (!bubble) bubble = sm_findClassView(cell, "BubbleView");
     if (!bubble) bubble = sm_messageBubble(cell);
     UIView *existing = [cell viewWithTag:kDeletedBadgeTag];
     if (!deleted) {
@@ -1994,6 +2178,7 @@ static void sm_updateDeletedCell(UIView *cell) {
         busy = NO;
         return;
     }
+    objc_setAssociatedObject(cell, &smCellMark, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (bubble) bubble.alpha = 0.55;
     sm_stripCrossViews(cell);
     UIImageView *badge = [existing isKindOfClass:[UIImageView class]] ? (UIImageView *)existing : nil;
@@ -2010,19 +2195,48 @@ static void sm_updateDeletedCell(UIView *cell) {
     CGFloat side = 13;
     UIColor *tint = [UIColor colorWithWhite:1 alpha:0.92];
     CGRect frame;
-    if (timeView) {
+    if (timeView && !CGRectIsEmpty(timeView.bounds)) {
         CGRect timeFrame = [timeView convertRect:timeView.bounds toView:cell];
-        side = MIN(14, MAX(11, CGRectGetHeight(timeFrame)));
-        frame = CGRectMake(CGRectGetMinX(timeFrame) - side - 4, CGRectGetMidY(timeFrame) - side / 2.0, side, side);
+        side = MIN(14, MAX(11, CGRectGetHeight(timeFrame) * 0.72));
+        frame = CGRectMake(CGRectGetMinX(timeFrame) - side - 3, CGRectGetMidY(timeFrame) - side / 2.0, side, side);
     } else {
         CGRect bubbleFrame = bubble ? [bubble convertRect:bubble.bounds toView:cell] : CGRectInset(cell.bounds, 12, 8);
-        frame = CGRectMake(CGRectGetMaxX(bubbleFrame) - 64, CGRectGetMaxY(bubbleFrame) - side - 7, side, side);
+        frame = CGRectMake(CGRectGetMaxX(bubbleFrame) - 72, CGRectGetMaxY(bubbleFrame) - side - 8, side, side);
     }
     if (CGRectGetMinX(frame) < 1) frame.origin.x = 1;
     badge.tintColor = tint;
     badge.frame = frame;
     [cell bringSubviewToFront:badge];
     busy = NO;
+}
+
+static IMP orig_bubbleLayout;
+static IMP orig_gradientLayout;
+static IMP orig_prepareReuse;
+
+static void swizzled_bubbleLayout(id self, SEL _cmd) {
+    ((void (*)(id, SEL))orig_bubbleLayout)(self, _cmd);
+    UIView *view = [self isKindOfClass:[UIView class]] ? (UIView *)self : nil;
+    while (view && !sm_isHistoryMessageCell(view)) view = view.superview;
+    if (view) sm_updateDeletedCell(view);
+}
+
+static void swizzled_gradientLayout(id self, SEL _cmd) {
+    ((void (*)(id, SEL))orig_gradientLayout)(self, _cmd);
+    UIView *view = [self isKindOfClass:[UIView class]] ? (UIView *)self : nil;
+    while (view && !sm_isHistoryMessageCell(view)) view = view.superview;
+    if (view) sm_updateDeletedCell(view);
+}
+
+static void swizzled_prepareReuse(id self, SEL _cmd) {
+    ((void (*)(id, SEL))orig_prepareReuse)(self, _cmd);
+    if (![self isKindOfClass:[UIView class]]) return;
+    UIView *cell = (UIView *)self;
+    objc_setAssociatedObject(cell, &smCellMark, nil, OBJC_ASSOCIATION_ASSIGN);
+    UIView *badge = [cell viewWithTag:kDeletedBadgeTag];
+    if (badge) [badge removeFromSuperview];
+    UIView *bubble = sm_namedView(cell, "bubbleView");
+    if (bubble) bubble.alpha = 1;
 }
 
 static void sm_markDeletedTree(UIView *view) {
