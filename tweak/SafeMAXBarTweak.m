@@ -1195,6 +1195,9 @@ static void swizzled_setMessages(id self, SEL _cmd, id messages) {
     ((void (*)(id, SEL, id))orig_setMessages)(self, _cmd, messages);
 }
 
+static IMP orig_bubbleLayout;
+static IMP orig_gradientLayout;
+static IMP orig_prepareReuse;
 static void swizzled_bubbleLayout(id self, SEL _cmd);
 static void swizzled_gradientLayout(id self, SEL _cmd);
 static void swizzled_prepareReuse(id self, SEL _cmd);
@@ -2209,10 +2212,6 @@ static void sm_updateDeletedCell(UIView *cell) {
     [cell bringSubviewToFront:badge];
     busy = NO;
 }
-
-static IMP orig_bubbleLayout;
-static IMP orig_gradientLayout;
-static IMP orig_prepareReuse;
 
 static void swizzled_bubbleLayout(id self, SEL _cmd) {
     ((void (*)(id, SEL))orig_bubbleLayout)(self, _cmd);
