@@ -51,13 +51,19 @@ jobs:
       - name: Allow background location
         run: |
           /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes: string location" "$APP/Info.plist" || true
-          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName MAX" "$APP/Info.plist"
-          /usr/libexec/PlistBuddy -c "Set :CFBundleName MAX" "$APP/Info.plist"
-          find "$APP" -name "InfoPlist.strings" | while read -r strings; do
-            plutil -convert xml1 "$strings" 2>/dev/null || true
-            /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName MAX" "$strings" || true
-            /usr/libexec/PlistBuddy -c "Set :CFBundleName MAX" "$strings" || true
-          done
+          python3 - << 'PY'
+          import os, pathlib, subprocess
+          app = pathlib.Path(os.environ["APP"])
+          for path in [app / "Info.plist", *app.rglob("Info.plist"), *app.rglob("InfoPlist.strings")]:
+              if not path.is_file():
+                  continue
+              subprocess.run(["plutil", "-convert", "xml1", str(path)], check=False)
+              data = path.read_bytes().replace(b"SafeMAX", b"MAX")
+              path.write_bytes(data)
+          subprocess.run(["/usr/libexec/PlistBuddy", "-c", "Set :CFBundleDisplayName MAX", str(app / "Info.plist")], check=False)
+          subprocess.run(["/usr/libexec/PlistBuddy", "-c", "Set :CFBundleName MAX", str(app / "Info.plist")], check=False)
+          subprocess.run(["/usr/libexec/PlistBuddy", "-c", "Print :CFBundleDisplayName", str(app / "Info.plist")], check=False)
+          PY
           /usr/libexec/PlistBuddy -c "Print :UIBackgroundModes" "$APP/Info.plist"
 
       - name: Build tweak dylib
