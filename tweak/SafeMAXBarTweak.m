@@ -749,7 +749,7 @@ static void presentEditor(UIViewController *from) {
             break;
         case 2:
             cell.textLabel.text = @"Удалённые сообщения";
-            cell.detailTextLabel.text = @"Остаются после перезапуска, тускнеют и помечаются ❌";
+            cell.detailTextLabel.text = @"Остаются после перезапуска и помечаются корзиной";
             on = keepDeleted();
             break;
         case 3:
@@ -1208,17 +1208,24 @@ static void sm_loadDeletedBodies(void) {
     });
 }
 
+static NSString *sm_withoutCross(NSString *text) {
+    if (text.length == 0) return text;
+    return [[text stringByReplacingOccurrencesOfString:@"❌ " withString:@""] stringByReplacingOccurrencesOfString:@"❌" withString:@""];
+}
+
 static BOOL sm_isDeletedBody(NSString *text) {
     if (text.length == 0) return NO;
     NSString *trimmed = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (trimmed.length == 0) return NO;
     if ([trimmed rangeOfString:@"❌"].location != NSNotFound) return YES;
+    NSString *clean = [sm_withoutCross(trimmed) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     sm_loadDeletedBodies();
     [smDeletedLock lock];
-    BOOL hit = [smDeletedBodies containsObject:trimmed];
-    if (!hit && trimmed.length > 2) {
+    BOOL hit = [smDeletedBodies containsObject:trimmed] || [smDeletedBodies containsObject:clean];
+    if (!hit && clean.length > 2) {
         for (NSString *body in smDeletedBodies) {
-            if (body.length >= 2 && [trimmed rangeOfString:body].location != NSNotFound && trimmed.length <= body.length + 16) {
+            NSString *plain = [sm_withoutCross(body) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (plain.length >= 2 && [clean rangeOfString:plain].location != NSNotFound && clean.length <= plain.length + 16) {
                 hit = YES;
                 break;
             }
@@ -1452,12 +1459,12 @@ static void sm_prefixDeletedMark(id message) {
     NSString *text = nil;
     Ivar ivar = sm_textIvar(messageText, &text);
     if (text.length == 0) text = sm_messageBody(message);
-    if (text.length == 0 || [text rangeOfString:@"❌"].location != NSNotFound) return;
-    NSString *marked = [@"❌ " stringByAppendingString:text];
+    if (text.length == 0 || [text rangeOfString:@"❌"].location == NSNotFound) return;
+    NSString *clean = sm_withoutCross(text);
     if (messageText && [messageText respondsToSelector:@selector(setText:)]) {
-        ((void (*)(id, SEL, id))objc_msgSend)(messageText, @selector(setText:), marked);
+        ((void (*)(id, SEL, id))objc_msgSend)(messageText, @selector(setText:), clean);
     } else if (ivar && messageText) {
-        object_setIvar(messageText, ivar, marked);
+        object_setIvar(messageText, ivar, clean);
     }
 }
 
@@ -1604,7 +1611,7 @@ static id sm_makeMessage(NSDictionary *rec) {
     if (!message) return nil;
     NSString *text = [rec[@"text"] isKindOfClass:[NSString class]] ? rec[@"text"] : nil;
     if (text.length && textClass) {
-        NSString *visible = [text containsString:@"❌"] ? text : [@"❌ " stringByAppendingString:text];
+        NSString *visible = sm_withoutCross(text);
         id allocated = ((id (*)(id, SEL))objc_msgSend)(textClass, @selector(alloc));
         id messageText = nil;
         if ([textClass instancesRespondToSelector:@selector(initWithText:)]) {
@@ -1840,6 +1847,42 @@ static UIView *sm_messageBubble(UIView *cell) {
     return best;
 }
 
+static BOOL sm_looksLikeTime(NSString *text) {
+    if (text.length < 4 || text.length > 8) return NO;
+    NSRange colon = [text rangeOfString:@":"];
+    if (colon.location == NSNotFound || colon.location == 0 || colon.location + 1 >= text.length) return NO;
+    NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:@"0123456789:"];
+    return [[text stringByTrimmingCharactersInSet:allowed] length] == 0;
+}
+
+static void sm_findTimeLabel(UIView *view, UIView *space, UILabel **best, CGFloat *bestY) {
+    if ([view isKindOfClass:[UILabel class]]) {
+        UILabel *label = (UILabel *)view;
+        if (sm_looksLikeTime(label.text)) {
+            CGRect frame = [label convertRect:label.bounds toView:space];
+            if (CGRectGetMaxY(frame) >= *bestY) {
+                *bestY = CGRectGetMaxY(frame);
+                *best = label;
+            }
+        }
+    }
+    for (UIView *subview in view.subviews) {
+        if (subview.tag == kDeletedBadgeTag) continue;
+        sm_findTimeLabel(subview, space, best, bestY);
+    }
+}
+
+static void sm_stripCrossViews(UIView *view) {
+    if (view.tag == kDeletedBadgeTag) return;
+    if ([view isKindOfClass:[UILabel class]]) {
+        UILabel *label = (UILabel *)view;
+        if ([label.text rangeOfString:@"❌"].location != NSNotFound) {
+            label.text = sm_withoutCross(label.text);
+        }
+    }
+    for (UIView *subview in view.subviews) sm_stripCrossViews(subview);
+}
+
 static void sm_updateDeletedCell(UIView *cell) {
     if (!sm_isHistoryMessageCell(cell)) return;
     static BOOL busy;
@@ -1847,38 +1890,43 @@ static void sm_updateDeletedCell(UIView *cell) {
     busy = YES;
     BOOL deleted = keepDeleted() && sm_treeHasDeletedText(cell);
     UIView *bubble = sm_messageBubble(cell);
-    UILabel *badge = (UILabel *)[cell viewWithTag:kDeletedBadgeTag];
+    UIView *existing = [cell viewWithTag:kDeletedBadgeTag];
     if (!deleted) {
-        if (badge) [badge removeFromSuperview];
+        if (existing) [existing removeFromSuperview];
         if (bubble && fabs(bubble.alpha - 1) > 0.01) bubble.alpha = 1;
         busy = NO;
         return;
     }
-    if (bubble) bubble.alpha = 0.62;
-    if (sm_treeHasMark(cell)) {
-        if (badge) [badge removeFromSuperview];
-        busy = NO;
-        return;
-    }
-    if (![badge isKindOfClass:[UILabel class]]) {
-        badge = [[UILabel alloc] init];
+    if (bubble) bubble.alpha = 0.72;
+    sm_stripCrossViews(cell);
+    UIImageView *badge = [existing isKindOfClass:[UIImageView class]] ? (UIImageView *)existing : nil;
+    if (!badge) {
+        if (existing) [existing removeFromSuperview];
+        badge = [[UIImageView alloc] init];
         badge.tag = kDeletedBadgeTag;
-        badge.text = @"❌";
-        badge.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
+        badge.contentMode = UIViewContentModeScaleAspectFit;
         badge.userInteractionEnabled = NO;
-        badge.backgroundColor = [UIColor clearColor];
+        badge.image = [[UIImage systemImageNamed:@"trash"] imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
         [cell addSubview:badge];
     }
-    CGRect frame = bubble ? [bubble convertRect:bubble.bounds toView:cell] : CGRectInset(cell.bounds, 12, 8);
-    BOOL outgoing = CGRectGetMidX(frame) > CGRectGetMidX(cell.bounds);
-    CGFloat side = 18;
-    CGFloat x = outgoing ? CGRectGetMinX(frame) - side - 3 : CGRectGetMaxX(frame) + 3;
-    CGFloat y = CGRectGetMidY(frame) - side / 2.0;
-    if (x < 1) x = 1;
-    CGFloat maxX = cell.bounds.size.width - side - 1;
-    if (x > maxX) x = MAX(1, maxX);
-    if (y < 1) y = 1;
-    badge.frame = CGRectMake(x, y, side, side);
+    UILabel *time = nil;
+    CGFloat bestY = -1;
+    if (bubble) sm_findTimeLabel(bubble, cell, &time, &bestY);
+    CGFloat side = 12;
+    UIColor *tint = [UIColor colorWithWhite:1 alpha:0.9];
+    CGRect frame;
+    if (time) {
+        CGRect timeFrame = [time convertRect:time.bounds toView:cell];
+        side = MIN(13, MAX(11, CGRectGetHeight(timeFrame)));
+        if (time.textColor) tint = [time.textColor colorWithAlphaComponent:0.9];
+        frame = CGRectMake(CGRectGetMinX(timeFrame) - side - 3, CGRectGetMidY(timeFrame) - side / 2.0, side, side);
+    } else {
+        CGRect bubbleFrame = bubble ? [bubble convertRect:bubble.bounds toView:cell] : CGRectInset(cell.bounds, 12, 8);
+        frame = CGRectMake(CGRectGetMaxX(bubbleFrame) - 62, CGRectGetMaxY(bubbleFrame) - side - 6, side, side);
+    }
+    if (CGRectGetMinX(frame) < 1) frame.origin.x = 1;
+    badge.tintColor = tint;
+    badge.frame = frame;
     [cell bringSubviewToFront:badge];
     busy = NO;
 }
@@ -2001,18 +2049,6 @@ static BOOL sm_audioBusy(void) {
 }
 
 static void sm_startSilentAudio(void) {
-    if (!bgNotify() || sm_audioBusy()) return;
-    NSError *error = nil;
-    AVAudioSession *session = [AVAudioSession sharedInstance];
-    [session setCategory:AVAudioSessionCategoryPlayback withOptions:AVAudioSessionCategoryOptionMixWithOthers error:&error];
-    [session setActive:YES error:&error];
-    if (!smSilentPlayer) {
-        smSilentPlayer = [[AVAudioPlayer alloc] initWithData:sm_silentWav() error:&error];
-        smSilentPlayer.numberOfLoops = -1;
-        smSilentPlayer.volume = 1;
-    }
-    if (smSilentPlayer && !smSilentPlayer.playing) [smSilentPlayer play];
-    smAudioOwned = smSilentPlayer.playing;
 }
 
 static void sm_stopSilentAudio(void) {
