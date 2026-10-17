@@ -446,6 +446,10 @@ static UIVisualEffect *makeGlass(void) {
     return [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterial];
 }
 
+static BOOL sm_flag(NSString *key);
+static UIColor *sm_savedColor(NSString *key, UIColor *fallback);
+static void sm_scheduleTheme(void);
+
 static void styleTabBar(UIView *bar) {
     if (!isBottomBar(bar)) return;
     applyLabels(bar);
