@@ -2075,56 +2075,13 @@ static void sm_deliver(NSString *title, NSString *body) {
     [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:request withCompletionHandler:nil];
 }
 
-static BOOL sm_valueMeansMuted(id value) {
-    if (!value || value == (id)kCFNull) return NO;
-    if ([value isKindOfClass:[NSDate class]]) return [(NSDate *)value timeIntervalSinceNow] > 0;
-    if ([value respondsToSelector:@selector(longLongValue)] && ![value isKindOfClass:[NSString class]]) {
-        long long stamp = [value longLongValue];
-        if (stamp == 0) return NO;
-        if (stamp < 0) return YES;
-        long long nowMs = (long long)([NSDate date].timeIntervalSince1970 * 1000.0);
-        if (stamp > 100000000000LL) return stamp > nowMs;
-        return stamp > nowMs / 1000;
-    }
-    SEL disturb = sel_registerName("isDontDisturb");
-    return [value respondsToSelector:disturb] && ((BOOL (*)(id, SEL))objc_msgSend)(value, disturb);
-}
+static id smChatService;
 
-static void sm_addMuteKey(NSMutableArray *keys, id value) {
-    if (!value || value == (id)kCFNull) return;
-    if (![keys containsObject:value]) [keys addObject:value];
-    if ([value respondsToSelector:@selector(stringValue)]) {
-        NSString *text = [value stringValue];
-        if (text.length && ![keys containsObject:text]) [keys addObject:text];
-    }
-}
-
-static BOOL sm_configIsMuted(id config) {
-    if (!config || config == (id)kCFNull) return NO;
-    if (sm_valueMeansMuted(config)) return YES;
-    if (sm_valueMeansMuted(sm_call(config, "dontDisturbUntil"))) return YES;
-    return sm_valueMeansMuted(sm_call(config, "dontDisturbUntilDate"));
-}
-
-static BOOL sm_chatMuted(id service, id chat, id chatId) {
-    id host = sm_call(service, "messengerConfig");
-    id configs = sm_call(host, "chatConfigurations");
-    if (![configs isKindOfClass:[NSDictionary class]] || [configs count] == 0) return NO;
-    NSDictionary *map = configs;
-    NSMutableArray *keys = [NSMutableArray array];
-    sm_addMuteKey(keys, sm_call(chat, "primaryKey"));
-    sm_addMuteKey(keys, chatId);
-    sm_addMuteKey(keys, sm_call(chat, "chatId"));
-    for (id key in keys) {
-        if (sm_configIsMuted([map objectForKey:key])) return YES;
-    }
-    id pk = sm_call(chat, "primaryKey");
-    if (!pk) return NO;
-    for (id config in map.allValues) {
-        id configPk = sm_call(config, "chatPk");
-        if (configPk && [configPk isEqual:pk] && sm_configIsMuted(config)) return YES;
-    }
-    return NO;
+static id sm_chatServiceFrom(id owner) {
+    id service = sm_call(owner, "chatService");
+    if (!service && [owner respondsToSelector:sel_registerName("cachedChatWithId:")]) service = owner;
+    if (service) smChatService = service;
+    return service ?: smChatService;
 }
 
 static id sm_cachedChat(id service, id chatId) {
@@ -2138,19 +2095,40 @@ static id sm_cachedChat(id service, id chatId) {
     }
 }
 
-static void sm_postIncoming(id note, id service) {
+static BOOL sm_pkMuted(id service, id pk) {
+    if (!pk || !service) return NO;
+    id host = sm_call(service, "messengerConfig");
+    SEL lookup = sel_registerName("chatConfigForChatPk:");
+    if (!host || ![host respondsToSelector:lookup]) return NO;
+    id config = nil;
+    @try {
+        config = ((id (*)(id, SEL, id))objc_msgSend)(host, lookup, pk);
+    } @catch (__unused NSException *exception) {
+        return NO;
+    }
+    SEL disturb = sel_registerName("isDontDisturb");
+    return config && [config respondsToSelector:disturb] && ((BOOL (*)(id, SEL))objc_msgSend)(config, disturb);
+}
+
+static BOOL sm_chatMuted(id service, id chat) {
+    return sm_pkMuted(service, sm_call(chat, "primaryKey"));
+}
+
+static void sm_postIncoming(id note, id owner) {
     if (!bgNotify() || !note) return;
     if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive) return;
     id message = sm_call(note, "message");
     if (!message) message = note;
     if ([message respondsToSelector:@selector(my)] && ((BOOL (*)(id, SEL))objc_msgSend)(message, @selector(my))) return;
+    id service = sm_chatServiceFrom(owner);
     id chatId = sm_call(note, "chatId");
     if (!chatId) chatId = sm_call(message, "chatId");
     id chat = sm_call(note, "chat");
+    if (!chat) chat = sm_call(message, "chat");
     if (!chatId) chatId = sm_call(chat, "chatId");
-    if (!service) service = sm_call(note, "chatService");
     if (!chat) chat = sm_cachedChat(service, chatId);
-    if (sm_chatMuted(service, chat, chatId)) return;
+    if (sm_chatMuted(service, chat)) return;
+    if (sm_pkMuted(service, sm_call(message, "chatPrimaryKey"))) return;
     NSString *body = sm_messageBody(message);
     if ([body containsString:@"\n—— было ——\n"]) body = [[body componentsSeparatedByString:@"\n—— было ——\n"] lastObject];
     body = [body stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
@@ -2168,22 +2146,6 @@ static void sm_postIncoming(id note, id service) {
 static IMP orig_showBanner;
 static void swizzled_showBanner(id self, SEL _cmd, id banner, BOOL suppress) {
     if (orig_showBanner) ((void (*)(id, SEL, id, BOOL))orig_showBanner)(self, _cmd, banner, suppress);
-    if (!bgNotify() || UIApplication.sharedApplication.applicationState == UIApplicationStateActive) return;
-    NSString *title = nil;
-    NSString *body = nil;
-    id titleLabel = sm_call(banner, "titleLabel");
-    id textLabel = sm_call(banner, "textLabel");
-    if ([titleLabel isKindOfClass:[UILabel class]]) title = ((UILabel *)titleLabel).text;
-    if ([textLabel isKindOfClass:[UILabel class]]) body = ((UILabel *)textLabel).text;
-    if (title.length == 0 && [sm_call(banner, "title") isKindOfClass:[NSString class]]) title = sm_call(banner, "title");
-    if (body.length == 0 && [sm_call(banner, "text") isKindOfClass:[NSString class]]) body = sm_call(banner, "text");
-    if (title.length || body.length) {
-        id chatId = sm_call(banner, "chatId");
-        id service = sm_call(self, "chatService");
-        id chat = sm_cachedChat(service, chatId);
-        if (sm_chatMuted(service, chat, chatId)) return;
-        sm_deliver(title, body);
-    }
 }
 
 static void swizzled_messageReceived(id self, SEL _cmd, id note) {
