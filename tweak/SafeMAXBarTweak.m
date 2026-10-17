@@ -2020,6 +2020,8 @@ static void sm_stopSilentAudio(void) {
     [[AVAudioSession sharedInstance] setActive:NO withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation error:nil];
 }
 
+static void sm_startLocation(void);
+
 static void sm_ensureAudioTimer(void) {
     if (smAudioTimer) return;
     smAudioTimer = [NSTimer scheduledTimerWithTimeInterval:15 repeats:YES block:^(__unused NSTimer *timer) {
