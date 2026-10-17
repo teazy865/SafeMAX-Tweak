@@ -975,9 +975,11 @@ static void sm_updateDeletedCell(UIView *cell);
 static NSDictionary *sm_snapshot(id message);
 static void sm_rememberSnapshot(NSDictionary *snap);
 static void sm_noteHistoryPage(id value);
+static void sm_captureOpenPages(void);
 
 static id swizzled_deleteLocal(id self, SEL _cmd, id messageIds, id chat) {
     if (keepDeleted()) {
+        sm_captureOpenPages();
         sm_noteDeletedPayload(messageIds, chat, self);
         return nil;
     }
@@ -1053,7 +1055,8 @@ static IMP orig_getMessages;
 static BOOL g_inMerge;
 static char smMergedSourceKey;
 static char smMergedValueKey;
-static CFAbsoluteTime smHistoryGuardUntil;
+static NSHashTable *smSeenPages;
+static NSMapTable *smPageSnapshots;
 static IMP orig_deletePks;
 static IMP orig_deletePksPublic;
 static IMP orig_deleteComplaint;
@@ -1063,12 +1066,41 @@ static IMP orig_processSparse;
 static IMP orig_processChunk;
 static IMP orig_processChunkNotify;
 
-static void sm_armHistoryGuard(void) {
-    smHistoryGuardUntil = CFAbsoluteTimeGetCurrent() + 25.0;
+static BOOL sm_historyGuard(void) {
+    return NO;
 }
 
-static BOOL sm_historyGuard(void) {
-    return keepDeleted() && CFAbsoluteTimeGetCurrent() < smHistoryGuardUntil;
+static void sm_trackPage(id page) {
+    if (!page || g_inMerge) return;
+    const char *name = class_getName(object_getClass(page));
+    if (!name || !strstr(name, "HistoryPage")) return;
+    if (!smSeenPages) smSeenPages = [NSHashTable weakObjectsHashTable];
+    [smSeenPages addObject:page];
+}
+
+static void sm_rememberLongerPage(id page, id messages) {
+    if (!page || ![messages isKindOfClass:[NSArray class]] || [(NSArray *)messages count] == 0) return;
+    if (!smPageSnapshots) smPageSnapshots = [NSMapTable weakToStrongObjectsMapTable];
+    id existing = [smPageSnapshots objectForKey:page];
+    if ([existing isKindOfClass:[NSArray class]] && [(NSArray *)existing count] >= [(NSArray *)messages count]) return;
+    [smPageSnapshots setObject:[(NSArray *)messages copy] forKey:page];
+}
+
+static id sm_longerSnapshot(id page, id messages) {
+    if (!smPageSnapshots || !page) return messages;
+    id snap = [smPageSnapshots objectForKey:page];
+    if (![snap isKindOfClass:[NSArray class]] || [(NSArray *)snap count] == 0) return messages;
+    NSUInteger newCount = [messages respondsToSelector:@selector(count)] ? [(NSArray *)messages count] : 0;
+    if ([(NSArray *)snap count] > newCount) return snap;
+    return messages;
+}
+
+static void sm_captureOpenPages(void) {
+    if (!keepDeleted() || !smSeenPages || !orig_getMessages) return;
+    for (id page in smSeenPages) {
+        id current = ((id (*)(id, SEL))orig_getMessages)(page, @selector(messages));
+        sm_rememberLongerPage(page, current);
+    }
 }
 
 static BOOL sm_isChunkCollection(id collection) {
@@ -1076,22 +1108,22 @@ static BOOL sm_isChunkCollection(id collection) {
 }
 
 static void swizzled_deletePks(id self, SEL _cmd, id pks, BOOL deleteForAll, id tasks) {
-    if (keepDeleted()) sm_armHistoryGuard();
+    if (keepDeleted()) sm_captureOpenPages();
     if (orig_deletePks) ((void (*)(id, SEL, id, BOOL, id))orig_deletePks)(self, _cmd, pks, deleteForAll, tasks);
 }
 
 static void swizzled_deleteComplaint(id self, SEL _cmd, id pks, BOOL deleteForAll, id complaint) {
-    if (keepDeleted()) sm_armHistoryGuard();
+    if (keepDeleted()) sm_captureOpenPages();
     if (orig_deleteComplaint) ((void (*)(id, SEL, id, BOOL, id))orig_deleteComplaint)(self, _cmd, pks, deleteForAll, complaint);
 }
 
 static void swizzled_deleteLegacy(id self, SEL _cmd, id pks, BOOL deleteForAll, id complaint) {
-    if (keepDeleted()) sm_armHistoryGuard();
+    if (keepDeleted()) sm_captureOpenPages();
     if (orig_deleteLegacy) ((void (*)(id, SEL, id, BOOL, id))orig_deleteLegacy)(self, _cmd, pks, deleteForAll, complaint);
 }
 
 static void swizzled_deletePksPublic(id self, SEL _cmd, id pks, BOOL deleteForAll) {
-    if (keepDeleted()) sm_armHistoryGuard();
+    if (keepDeleted()) sm_captureOpenPages();
     if (orig_deletePksPublic) ((void (*)(id, SEL, id, BOOL))orig_deletePksPublic)(self, _cmd, pks, deleteForAll);
 }
 
@@ -1172,6 +1204,9 @@ static id sm_mergeKeptInto(id page, id messages);
 static id swizzled_getMessages(id self, SEL _cmd) {
     id messages = ((id (*)(id, SEL))orig_getMessages)(self, _cmd);
     if (!keepDeleted() || g_inMerge) return messages;
+    sm_trackPage(self);
+    sm_rememberLongerPage(self, messages);
+    messages = sm_longerSnapshot(self, messages);
     id cachedSource = objc_getAssociatedObject(self, &smMergedSourceKey);
     id cachedMerged = objc_getAssociatedObject(self, &smMergedValueKey);
     if (cachedSource == messages && cachedMerged) return cachedMerged;
@@ -1188,10 +1223,14 @@ static void swizzled_setMessages(id self, SEL _cmd, id messages) {
     if (keepDeleted() && !g_inMerge) {
         const char *name = class_getName(object_getClass(self));
         if (name && strstr(name, "HistoryPage")) {
+            sm_trackPage(self);
+            id preserved = sm_longerSnapshot(self, messages);
+            if (preserved != messages) messages = preserved;
             g_inMerge = YES;
             id merged = sm_mergeKeptInto(self, messages);
             g_inMerge = NO;
             if (merged) messages = merged;
+            sm_rememberLongerPage(self, messages);
             objc_setAssociatedObject(self, &smMergedSourceKey, nil, OBJC_ASSOCIATION_ASSIGN);
             objc_setAssociatedObject(self, &smMergedValueKey, nil, OBJC_ASSOCIATION_ASSIGN);
         }
@@ -1598,7 +1637,6 @@ static id sm_readConnection(id serviceOwner) {
 }
 
 static void sm_noteDeletedPayload(id ids, id chat, id serviceOwner) {
-    if (keepDeleted()) sm_armHistoryGuard();
     NSMutableArray *items = [NSMutableArray array];
     if ([ids isKindOfClass:[NSArray class]] || [ids isKindOfClass:[NSSet class]] || [ids isKindOfClass:[NSOrderedSet class]]) {
         for (id item in ids) if (item) [items addObject:item];
@@ -1657,7 +1695,7 @@ static void sm_noteDeletedPayload(id ids, id chat, id serviceOwner) {
         sm_prefixDeletedMark(message);
         sm_writeMarkedMessage(connection, message);
     }
-    if (snaps.count || messages.count) sm_reloadHistory();
+    if (snaps.count || messages.count) sm_refreshDeletedLooks();
 }
 
 static BOOL sm_sameChat(NSDictionary *rec, id sample) {
