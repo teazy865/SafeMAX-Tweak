@@ -723,14 +723,17 @@ static void presentEditor(UIViewController *from) {
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section { return 5; }
 
-- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath { return 60; }
+- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath { return 88; }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"g"];
     if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"g"];
     cell.backgroundColor = [UIColor colorWithWhite:0.14 alpha:1];
     cell.textLabel.textColor = [UIColor whiteColor];
+    cell.textLabel.numberOfLines = 1;
     cell.detailTextLabel.textColor = [UIColor colorWithWhite:1 alpha:0.55];
+    cell.detailTextLabel.numberOfLines = 0;
+    cell.detailTextLabel.lineBreakMode = NSLineBreakByWordWrapping;
     cell.selectionStyle = UITableViewCellSelectionStyleNone;
     BOOL on = NO;
     switch (indexPath.row) {
@@ -2072,13 +2075,42 @@ static void sm_deliver(NSString *title, NSString *body) {
     [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:request withCompletionHandler:nil];
 }
 
-static void sm_postIncoming(id note) {
+static BOOL sm_chatMuted(id service, id chatId) {
+    if (!service || !chatId) return NO;
+    SEL sel = sel_registerName("chatConfigForChatWithId:");
+    if (![service respondsToSelector:sel]) return NO;
+    id config = nil;
+    @try {
+        config = ((id (*)(id, SEL, id))objc_msgSend)(service, sel, chatId);
+    } @catch (__unused NSException *exception) {
+        return NO;
+    }
+    SEL disturb = sel_registerName("isDontDisturb");
+    return config && [config respondsToSelector:disturb] && ((BOOL (*)(id, SEL))objc_msgSend)(config, disturb);
+}
+
+static void sm_postIncoming(id note, id service) {
     if (!bgNotify() || !note) return;
     if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive) return;
     id message = sm_call(note, "message");
     if (!message) message = note;
     if ([message respondsToSelector:@selector(my)] && ((BOOL (*)(id, SEL))objc_msgSend)(message, @selector(my))) return;
+    id chatId = sm_call(note, "chatId");
+    if (!chatId) chatId = sm_call(message, "chatId");
     id chat = sm_call(note, "chat");
+    if (!chatId) chatId = sm_call(chat, "chatId");
+    if (!service) service = sm_call(note, "chatService");
+    if (sm_chatMuted(service, chatId)) return;
+    if (!chat && service && chatId) {
+        SEL cached = sel_registerName("cachedChatWithId:");
+        if ([service respondsToSelector:cached]) {
+            @try {
+                chat = ((id (*)(id, SEL, id))objc_msgSend)(service, cached, chatId);
+            } @catch (__unused NSException *exception) {
+                chat = nil;
+            }
+        }
+    }
     NSString *body = sm_messageBody(message);
     if ([body containsString:@"\n—— было ——\n"]) body = [[body componentsSeparatedByString:@"\n—— было ——\n"] lastObject];
     body = [body stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
@@ -2105,12 +2137,16 @@ static void swizzled_showBanner(id self, SEL _cmd, id banner, BOOL suppress) {
     if ([textLabel isKindOfClass:[UILabel class]]) body = ((UILabel *)textLabel).text;
     if (title.length == 0 && [sm_call(banner, "title") isKindOfClass:[NSString class]]) title = sm_call(banner, "title");
     if (body.length == 0 && [sm_call(banner, "text") isKindOfClass:[NSString class]]) body = sm_call(banner, "text");
-    if (title.length || body.length) sm_deliver(title, body);
+    if (title.length || body.length) {
+        id chatId = sm_call(banner, "chatId");
+        if (sm_chatMuted(sm_call(self, "chatService"), chatId)) return;
+        sm_deliver(title, body);
+    }
 }
 
 static void swizzled_messageReceived(id self, SEL _cmd, id note) {
     if (orig_messageReceived) ((void (*)(id, SEL, id))orig_messageReceived)(self, _cmd, note);
-    sm_postIncoming(note);
+    sm_postIncoming(note, self);
 }
 
 static CLLocationManager *smLoc;
