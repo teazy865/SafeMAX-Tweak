@@ -1043,6 +1043,24 @@ static void swizzled_sendNextPass(id self, SEL _cmd, id value) {
     ((void (*)(id, SEL, id))orig_sendNextPass)(self, _cmd, value);
 }
 
+static IMP orig_deletePks;
+static IMP orig_deletePksPublic;
+
+static void swizzled_deletePks(id self, SEL _cmd, id pks, BOOL deleteForAll, id tasks) {
+    if (keepDeleted()) {
+        sm_noteDeletedPayload(pks, nil, self);
+        return;
+    }
+    ((void (*)(id, SEL, id, BOOL, id))orig_deletePks)(self, _cmd, pks, deleteForAll, tasks);
+}
+
+static void swizzled_deletePksPublic(id self, SEL _cmd, id pks, BOOL deleteForAll) {
+    if (keepDeleted()) {
+        sm_noteDeletedPayload(pks, nil, self);
+        return;
+    }
+    ((void (*)(id, SEL, id, BOOL))orig_deletePksPublic)(self, _cmd, pks, deleteForAll);
+}
 static IMP orig_removeObject;
 static IMP orig_removeObjects;
 static IMP orig_setDbObject;
@@ -1123,6 +1141,8 @@ static void hookKeepDeleted(void) {
     sm_hook_own(smMessageClass, "setStatus:", (IMP)swizzled_setStatus, &orig_setStatus);
     sm_hook_own(smMessageClass, "status", (IMP)swizzled_status, &orig_status);
     sm_hook_own(objc_getClass("OKMChatService"), "deleteLocallyMessagesWithIds:updateChat:", (IMP)swizzled_deleteLocal, &orig_deleteLocal);
+    sm_hook_own(objc_getClass("OKMChatService"), "deleteMessagesWithPks:deleteForAll:", (IMP)swizzled_deletePksPublic, &orig_deletePksPublic);
+    sm_hook_own(objc_getClass("OKMChatService"), "_deleteMessagesWithPks:deleteForAll:enqueueTasks:", (IMP)swizzled_deletePks, &orig_deletePks);
     Class listener = objc_getClass("OKMMessageDeleteListener");
     sm_hook_own(listener, "_messagesDeleted:inChat:", (IMP)swizzled_messagesDeleted, &orig_messagesDeleted);
     sm_hook_own(listener, "_delayedMessagesDeleted:", (IMP)swizzled_delayedDeleted, &orig_delayedDeleted);
@@ -1457,21 +1477,11 @@ static id sm_writeBlock(void) {
     return ready ? (__bridge id)&block : nil;
 }
 
+static char smKeptFlag;
+
 static void sm_prefixDeletedMark(id message) {
-    if (!message || (smMessageClass && ![message isKindOfClass:smMessageClass] && ![message respondsToSelector:@selector(messageText)])) return;
-    id messageText = sm_call(message, "messageText");
-    NSString *text = nil;
-    Ivar ivar = sm_textIvar(messageText, &text);
-    if (text.length == 0) text = sm_messageBody(message);
-    text = sm_withoutCross(text);
-    text = [text stringByReplacingOccurrencesOfString:smDeletedMark withString:@""];
-    if (text.length == 0) return;
-    NSString *marked = [smDeletedMark stringByAppendingString:text];
-    if (messageText && [messageText respondsToSelector:@selector(setText:)]) {
-        ((void (*)(id, SEL, id))objc_msgSend)(messageText, @selector(setText:), marked);
-    } else if (ivar && messageText) {
-        object_setIvar(messageText, ivar, marked);
-    }
+    if (!message) return;
+    objc_setAssociatedObject(message, &smKeptFlag, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 static void sm_writeMarkedMessage(id connection, id message) {
@@ -1525,6 +1535,20 @@ static void sm_noteDeletedPayload(id ids, id chat, id serviceOwner) {
         [items addObject:ids];
     }
     if (items.count == 0) return;
+    for (id item in items) {
+        if (smMessageClass && [item isKindOfClass:smMessageClass]) {
+            sm_prefixDeletedMark(item);
+            NSDictionary *snap = sm_snapshot(item);
+            if (snap) sm_rememberSnapshot(snap);
+            continue;
+        }
+        id stored = sm_plistId(item);
+        if ([stored isKindOfClass:[NSString class]] && [(NSString *)stored length]) {
+            sm_rememberSnapshot(@{@"pk": stored});
+        } else if ([stored isKindOfClass:[NSNumber class]] && [stored longLongValue] > 1000) {
+            sm_rememberSnapshot(@{@"sid": stored});
+        }
+    }
     g_lookupIds = items;
     g_lookupChat = chat;
     g_lookupSnaps = [NSMutableArray array];
@@ -1799,10 +1823,11 @@ static NSString *sm_viewText(UIView *view) {
         if ([text isKindOfClass:[NSString class]] && [text length]) return text;
     }
     const char *name = class_getName(object_getClass(view));
+    NSString *ivarText = nil;
+    sm_textIvar(view, &ivarText);
+    if (ivarText.length) return ivarText;
     if (name && (strstr(name, "Text") || strstr(name, "Label") || strstr(name, "Message"))) {
-        NSString *ivarText = nil;
-        sm_textIvar(view, &ivarText);
-        if (ivarText.length) return ivarText;
+        return nil;
     }
     return nil;
 }
@@ -1867,24 +1892,48 @@ static BOOL sm_objectIsDeletedMessage(id object) {
     return NO;
 }
 
+static BOOL sm_keyIsKept(id key) {
+    if (objc_getAssociatedObject(key, &smKeptFlag)) return YES;
+    if (sm_isKeptKey(key) || sm_isKeptServerId(key)) return YES;
+    id pk = sm_call(key, "messagePk");
+    if (!pk) pk = sm_call(key, "primaryKey");
+    if (!pk) pk = sm_call(key, "messageId");
+    if (!pk) pk = sm_call(key, "serverId");
+    return sm_isKeptKey(pk) || sm_isKeptServerId(pk);
+}
+
+static BOOL sm_objectTreeKept(id object, int depth);
+
 static BOOL sm_viewOwnsDeleted(UIView *view) {
-    Class cls = object_getClass(view);
-    while (cls && cls != [UIView class] && cls != [UIResponder class] && cls != [NSObject class]) {
+    if (sm_objectTreeKept(view, 0)) return YES;
+    for (UIView *subview in view.subviews) {
+        if (subview.tag == kDeletedBadgeTag) continue;
+        if (sm_viewOwnsDeleted(subview)) return YES;
+    }
+    return NO;
+}
+
+static BOOL sm_objectTreeKept(id object, int depth) {
+    if (!object || depth > 3 || [object isKindOfClass:[NSString class]] || [object isKindOfClass:[NSNumber class]]) return NO;
+    if (sm_keyIsKept(object) || sm_objectIsDeletedMessage(object)) return YES;
+    if ([object isKindOfClass:[UIView class]] && depth > 0) return NO;
+    Class cls = object_getClass(object);
+    while (cls && cls != [NSObject class]) {
         unsigned int count = 0;
         Ivar *ivars = class_copyIvarList(cls, &count);
         for (unsigned int i = 0; i < count; i++) {
             const char *type = ivar_getTypeEncoding(ivars[i]);
             if (!type || type[0] != '@') continue;
-            id value = object_getIvar(view, ivars[i]);
-            if ([value isKindOfClass:[NSString class]] && sm_isDeletedBody(value)) {
-                free(ivars);
-                return YES;
+            id value = object_getIvar(object, ivars[i]);
+            if ([value isKindOfClass:[NSString class]] || [value isKindOfClass:[NSAttributedString class]]) {
+                NSString *text = [value isKindOfClass:[NSString class]] ? value : ((NSAttributedString *)value).string;
+                if (sm_isDeletedBody(text)) {
+                    free(ivars);
+                    return YES;
+                }
+                continue;
             }
-            if ([value isKindOfClass:[NSAttributedString class]] && sm_isDeletedBody(((NSAttributedString *)value).string)) {
-                free(ivars);
-                return YES;
-            }
-            if (sm_objectIsDeletedMessage(value)) {
+            if (sm_objectTreeKept(value, depth + 1)) {
                 free(ivars);
                 return YES;
             }
@@ -1908,29 +1957,15 @@ static UIView *sm_namedView(UIView *view, const char *ivarName) {
     return nil;
 }
 
-static BOOL sm_looksLikeTime(NSString *text) {
-    if (text.length < 4 || text.length > 8) return NO;
-    NSRange colon = [text rangeOfString:@":"];
-    if (colon.location == NSNotFound || colon.location == 0 || colon.location + 1 >= text.length) return NO;
-    NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:@"0123456789:"];
-    return [[text stringByTrimmingCharactersInSet:allowed] length] == 0;
-}
-
-static void sm_findTimeLabel(UIView *view, UIView *space, UILabel **best, CGFloat *bestY) {
-    if ([view isKindOfClass:[UILabel class]]) {
-        UILabel *label = (UILabel *)view;
-        if (sm_looksLikeTime(label.text)) {
-            CGRect frame = [label convertRect:label.bounds toView:space];
-            if (CGRectGetMaxY(frame) >= *bestY) {
-                *bestY = CGRectGetMaxY(frame);
-                *best = label;
-            }
-        }
-    }
+static UIView *sm_findClassView(UIView *view, const char *needle) {
+    const char *name = class_getName(object_getClass(view));
+    if (name && strstr(name, needle)) return view;
     for (UIView *subview in view.subviews) {
         if (subview.tag == kDeletedBadgeTag) continue;
-        sm_findTimeLabel(subview, space, best, bestY);
+        UIView *found = sm_findClassView(subview, needle);
+        if (found) return found;
     }
+    return nil;
 }
 
 static void sm_stripCrossViews(UIView *view) {
@@ -1950,7 +1985,7 @@ static void sm_updateDeletedCell(UIView *cell) {
     if (busy) return;
     busy = YES;
     BOOL deleted = keepDeleted() && (sm_treeHasDeletedText(cell) || sm_viewOwnsDeleted(cell));
-    UIView *bubble = sm_namedView(cell, "mainViewContainerView");
+    UIView *bubble = sm_namedView(cell, "bubbleView");
     if (!bubble) bubble = sm_messageBubble(cell);
     UIView *existing = [cell viewWithTag:kDeletedBadgeTag];
     if (!deleted) {
@@ -1959,7 +1994,7 @@ static void sm_updateDeletedCell(UIView *cell) {
         busy = NO;
         return;
     }
-    if (bubble) bubble.alpha = 0.72;
+    if (bubble) bubble.alpha = 0.55;
     sm_stripCrossViews(cell);
     UIImageView *badge = [existing isKindOfClass:[UIImageView class]] ? (UIImageView *)existing : nil;
     if (!badge) {
@@ -1971,20 +2006,17 @@ static void sm_updateDeletedCell(UIView *cell) {
         badge.image = [[UIImage systemImageNamed:@"trash"] imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
         [cell addSubview:badge];
     }
-    UILabel *time = nil;
-    CGFloat bestY = -1;
-    if (bubble) sm_findTimeLabel(bubble, cell, &time, &bestY);
-    CGFloat side = 12;
-    UIColor *tint = [UIColor colorWithWhite:1 alpha:0.9];
+    UIView *timeView = sm_findClassView(cell, "MessageTimeAndStatusView");
+    CGFloat side = 13;
+    UIColor *tint = [UIColor colorWithWhite:1 alpha:0.92];
     CGRect frame;
-    if (time) {
-        CGRect timeFrame = [time convertRect:time.bounds toView:cell];
-        side = MIN(13, MAX(11, CGRectGetHeight(timeFrame)));
-        if (time.textColor) tint = [time.textColor colorWithAlphaComponent:0.9];
-        frame = CGRectMake(CGRectGetMinX(timeFrame) - side - 3, CGRectGetMidY(timeFrame) - side / 2.0, side, side);
+    if (timeView) {
+        CGRect timeFrame = [timeView convertRect:timeView.bounds toView:cell];
+        side = MIN(14, MAX(11, CGRectGetHeight(timeFrame)));
+        frame = CGRectMake(CGRectGetMinX(timeFrame) - side - 4, CGRectGetMidY(timeFrame) - side / 2.0, side, side);
     } else {
         CGRect bubbleFrame = bubble ? [bubble convertRect:bubble.bounds toView:cell] : CGRectInset(cell.bounds, 12, 8);
-        frame = CGRectMake(CGRectGetMaxX(bubbleFrame) - 62, CGRectGetMaxY(bubbleFrame) - side - 6, side, side);
+        frame = CGRectMake(CGRectGetMaxX(bubbleFrame) - 64, CGRectGetMaxY(bubbleFrame) - side - 7, side, side);
     }
     if (CGRectGetMinX(frame) < 1) frame.origin.x = 1;
     badge.tintColor = tint;
