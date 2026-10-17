@@ -976,6 +976,10 @@ static NSDictionary *sm_snapshot(id message);
 static void sm_rememberSnapshot(NSDictionary *snap);
 static void sm_noteHistoryPage(id value);
 static void sm_captureOpenPages(void);
+static void sm_reloadHistory(void);
+static void sm_keepInsteadOfDelete(id service, id ids);
+static id sm_call(id obj, const char *selName);
+static void sm_prefixDeletedMark(id message);
 
 static id swizzled_deleteLocal(id self, SEL _cmd, id messageIds, id chat) {
     if (keepDeleted()) {
@@ -1107,23 +1111,76 @@ static BOOL sm_isChunkCollection(id collection) {
     return [collection isKindOfClass:[NSString class]] && [(NSString *)collection isEqualToString:@"history_chunks"];
 }
 
+static BOOL sm_sameId(id message, id needle) {
+    if (!message || !needle || message == needle) return message == needle;
+    id pk = sm_call(message, "primaryKey");
+    if (pk && ([pk isEqual:needle] || [[pk description] isEqual:[needle description]])) return YES;
+    id sid = sm_call(message, "serverId");
+    if (!sid) return NO;
+    if ([sid isEqual:needle] || [[sid description] isEqual:[needle description]]) return YES;
+    if ([sid respondsToSelector:@selector(longLongValue)] && [needle respondsToSelector:@selector(longLongValue)]) {
+        long long left = [sid longLongValue];
+        long long right = [needle longLongValue];
+        if (left && left == right) return YES;
+    }
+    return NO;
+}
+
+static void sm_markIdsInOpenPages(id ids) {
+    NSMutableArray *items = [NSMutableArray array];
+    if ([ids isKindOfClass:[NSArray class]] || [ids isKindOfClass:[NSSet class]] || [ids isKindOfClass:[NSOrderedSet class]]) {
+        for (id item in ids) if (item) [items addObject:item];
+    } else if (ids) {
+        [items addObject:ids];
+    }
+    if (items.count == 0 || !smSeenPages || !orig_getMessages) return;
+    for (id page in smSeenPages) {
+        id current = ((id (*)(id, SEL))orig_getMessages)(page, @selector(messages));
+        if (![current respondsToSelector:@selector(countByEnumeratingWithState:objects:count:)]) continue;
+        for (id message in current) {
+            for (id item in items) {
+                if (sm_sameId(message, item)) sm_prefixDeletedMark(message);
+            }
+        }
+    }
+}
+
+static void sm_keepInsteadOfDelete(id service, id ids) {
+    sm_captureOpenPages();
+    sm_markIdsInOpenPages(ids);
+    sm_noteDeletedPayload(ids, nil, service);
+    sm_reloadHistory();
+}
+
 static void swizzled_deletePks(id self, SEL _cmd, id pks, BOOL deleteForAll, id tasks) {
-    if (keepDeleted()) sm_captureOpenPages();
+    if (keepDeleted()) {
+        sm_keepInsteadOfDelete(self, pks);
+        return;
+    }
     if (orig_deletePks) ((void (*)(id, SEL, id, BOOL, id))orig_deletePks)(self, _cmd, pks, deleteForAll, tasks);
 }
 
 static void swizzled_deleteComplaint(id self, SEL _cmd, id pks, BOOL deleteForAll, id complaint) {
-    if (keepDeleted()) sm_captureOpenPages();
+    if (keepDeleted()) {
+        sm_keepInsteadOfDelete(self, pks);
+        return;
+    }
     if (orig_deleteComplaint) ((void (*)(id, SEL, id, BOOL, id))orig_deleteComplaint)(self, _cmd, pks, deleteForAll, complaint);
 }
 
 static void swizzled_deleteLegacy(id self, SEL _cmd, id pks, BOOL deleteForAll, id complaint) {
-    if (keepDeleted()) sm_captureOpenPages();
+    if (keepDeleted()) {
+        sm_keepInsteadOfDelete(self, pks);
+        return;
+    }
     if (orig_deleteLegacy) ((void (*)(id, SEL, id, BOOL, id))orig_deleteLegacy)(self, _cmd, pks, deleteForAll, complaint);
 }
 
 static void swizzled_deletePksPublic(id self, SEL _cmd, id pks, BOOL deleteForAll) {
-    if (keepDeleted()) sm_captureOpenPages();
+    if (keepDeleted()) {
+        sm_keepInsteadOfDelete(self, pks);
+        return;
+    }
     if (orig_deletePksPublic) ((void (*)(id, SEL, id, BOOL))orig_deletePksPublic)(self, _cmd, pks, deleteForAll);
 }
 
