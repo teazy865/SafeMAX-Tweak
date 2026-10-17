@@ -21,10 +21,21 @@ static NSString *const kAntiReadKey = @"SafeMAX_AntiRead";
 static NSString *const kKeepDeletedKey = @"SafeMAX_KeepDeleted";
 static NSString *const kKeepEditsKey = @"SafeMAX_KeepEdits";
 static NSString *const kBgNotifyKey = @"SafeMAX_BgNotify";
+static NSString *const kHiddenKey = @"SafeMAX_HiddenTabs";
+static NSString *const kAmoledKey = @"SafeMAX_Amoled";
+static NSString *const kColorBgOn = @"SafeMAX_ColorBgOn";
+static NSString *const kColorBg = @"SafeMAX_ColorBg";
+static NSString *const kColorCardOn = @"SafeMAX_ColorCardOn";
+static NSString *const kColorCard = @"SafeMAX_ColorCard";
+static NSString *const kColorDockOn = @"SafeMAX_ColorDockOn";
+static NSString *const kColorDock = @"SafeMAX_ColorDock";
+static NSString *const kColorTextOn = @"SafeMAX_ColorTextOn";
+static NSString *const kColorText = @"SafeMAX_ColorText";
 
 static const NSInteger kEntryTag = 0x5AF1;
 static const NSInteger kPillTag = 0x5AF3;
 static const NSInteger kGhostTag = 0x5AF5;
+static const NSInteger kThemeTag = 0x5AF6;
 
 static Class TabBarClass;
 static Class SettingsClass;
@@ -90,6 +101,28 @@ static NSArray<NSString *> *savedOrder(void) {
 
 static void saveOrder(NSArray<NSString *> *order) {
     [[NSUserDefaults standardUserDefaults] setObject:order forKey:kOrderKey];
+}
+
+static NSMutableSet<NSString *> *hiddenTabs(void) {
+    static NSMutableSet *titles;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSArray *saved = [[NSUserDefaults standardUserDefaults] arrayForKey:kHiddenKey];
+        titles = [NSMutableSet setWithArray:[saved isKindOfClass:[NSArray class]] ? saved : @[]];
+    });
+    return titles;
+}
+
+static void saveHidden(void) {
+    [[NSUserDefaults standardUserDefaults] setObject:hiddenTabs().allObjects forKey:kHiddenKey];
+}
+
+static BOOL tabIsProtected(NSString *title) {
+    return [title isEqualToString:@"Настройки"] || [title isEqualToString:@"Settings"];
+}
+
+static BOOL tabIsHidden(NSString *title) {
+    return title.length && !tabIsProtected(title) && [hiddenTabs() containsObject:title];
 }
 
 static NSSet<NSString *> *knownTitles(void) {
@@ -253,32 +286,50 @@ static void alignIcons(UIView *bar) {
 }
 
 static void applyOrder(UIView *bar) {
-    NSArray<NSString *> *order = savedOrder();
-    if (order.count == 0) return;
     NSArray<UIView *> *items = tabItems(bar);
     if (items.count < 2) return;
-    NSMutableArray<NSNumber *> *slots = [NSMutableArray array];
-    for (UIView *item in items) [slots addObject:@(item.center.x)];
-    NSMutableArray<UIView *> *arranged = [NSMutableArray array];
-    NSMutableSet *used = [NSMutableSet set];
-    for (NSString *title in order) {
-        for (UIView *item in items) {
-            if ([used containsObject:item]) continue;
-            if ([titleOfItem(item) isEqualToString:title]) {
-                [arranged addObject:item];
-                [used addObject:item];
-                break;
+    NSMutableArray<UIView *> *visible = [NSMutableArray array];
+    CGFloat left = CGFLOAT_MAX;
+    CGFloat right = 0;
+    for (UIView *item in items) {
+        NSNumber *saved = objc_getAssociatedObject(item, "sm_slot");
+        CGFloat slot = saved ? saved.doubleValue : item.center.x;
+        if (!saved && item.center.x > 1) {
+            objc_setAssociatedObject(item, "sm_slot", @(item.center.x), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            slot = item.center.x;
+        }
+        if (slot < left) left = slot;
+        if (slot > right) right = slot;
+        BOOL hide = tabIsHidden(titleOfItem(item));
+        item.hidden = hide;
+        item.userInteractionEnabled = !hide;
+        if (!hide) [visible addObject:item];
+    }
+    NSArray<NSString *> *order = savedOrder();
+    if (order.count) {
+        NSMutableArray<UIView *> *arranged = [NSMutableArray array];
+        NSMutableSet *used = [NSMutableSet set];
+        for (NSString *title in order) {
+            for (UIView *item in visible) {
+                if ([used containsObject:item]) continue;
+                if ([titleOfItem(item) isEqualToString:title]) {
+                    [arranged addObject:item];
+                    [used addObject:item];
+                    break;
+                }
             }
         }
+        for (UIView *item in visible) {
+            if (![used containsObject:item]) [arranged addObject:item];
+        }
+        visible = arranged;
     }
-    for (UIView *item in items) {
-        if (![used containsObject:item]) [arranged addObject:item];
-    }
-    NSUInteger n = MIN(arranged.count, slots.count);
-    for (NSUInteger i = 0; i < n; i++) {
-        UIView *item = arranged[i];
+    NSUInteger count = visible.count;
+    if (count == 0 || right <= left) return;
+    for (NSUInteger i = 0; i < count; i++) {
+        UIView *item = visible[i];
         CGPoint center = item.center;
-        center.x = slots[i].doubleValue;
+        center.x = count == 1 ? (left + right) / 2.0 : left + (right - left) * i / (count - 1);
         item.center = center;
     }
 }
@@ -462,6 +513,12 @@ static void styleTabBar(UIView *bar) {
     glass.layer.cornerRadius = height / 2.0;
     glass.layer.cornerCurve = kCACornerCurveCircular;
     [bar sendSubviewToBack:pill];
+    if (sm_flag(kColorDockOn)) {
+        UIColor *dock = [sm_savedColor(kColorDock, [UIColor colorWithWhite:0.12 alpha:1]) colorWithAlphaComponent:0.62];
+        pill.backgroundColor = dock;
+        glass.backgroundColor = dock;
+    }
+    sm_scheduleTheme();
 }
 
 static UIView *locateBar(void) {
@@ -486,16 +543,122 @@ static void styleAllBars(void) {
     if (bar) styleTabBar(bar);
 }
 
+static UIColor *g_plateColor;
+static CGFloat g_plateRadius = 18;
+
+static BOOL sm_amoled(void) {
+    id obj = [[NSUserDefaults standardUserDefaults] objectForKey:kAmoledKey];
+    return obj ? [obj boolValue] : NO;
+}
+
+static BOOL sm_flag(NSString *key) {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:key];
+}
+
+static UIColor *sm_colorFromHex(NSString *hex, UIColor *fallback) {
+    if (hex.length != 6) return fallback;
+    unsigned value = 0;
+    [[NSScanner scannerWithString:hex] scanHexInt:&value];
+    return [UIColor colorWithRed:((value >> 16) & 255) / 255.0 green:((value >> 8) & 255) / 255.0 blue:(value & 255) / 255.0 alpha:1];
+}
+
+static NSString *sm_hexFromColor(UIColor *color) {
+    CGFloat r = 1, g = 1, b = 1, a = 1;
+    if (![color getRed:&r green:&g blue:&b alpha:&a]) {
+        CGFloat w = 1;
+        if ([color getWhite:&w alpha:&a]) r = g = b = w;
+    }
+    return [NSString stringWithFormat:@"%02X%02X%02X", (int)lround(r * 255), (int)lround(g * 255), (int)lround(b * 255)];
+}
+
+static UIColor *sm_savedColor(NSString *key, UIColor *fallback) {
+    NSString *hex = [[NSUserDefaults standardUserDefaults] stringForKey:key];
+    return sm_colorFromHex(hex, fallback);
+}
+
+static void sm_storeColor(NSString *key, UIColor *color) {
+    [[NSUserDefaults standardUserDefaults] setObject:sm_hexFromColor(color) forKey:key];
+}
+
+static BOOL sm_readColor(UIColor *color, CGFloat *red, CGFloat *green, CGFloat *blue, CGFloat *alpha) {
+    if (!color) return NO;
+    CGFloat r = 0, g = 0, b = 0, a = 0;
+    if ([color getRed:&r green:&g blue:&b alpha:&a]) {
+        if (red) *red = r;
+        if (green) *green = g;
+        if (blue) *blue = b;
+        if (alpha) *alpha = a;
+        return YES;
+    }
+    CGFloat w = 0;
+    if (![color getWhite:&w alpha:&a]) return NO;
+    if (red) *red = w;
+    if (green) *green = w;
+    if (blue) *blue = w;
+    if (alpha) *alpha = a;
+    return YES;
+}
+
+static BOOL sm_isDarkGray(UIColor *color) {
+    CGFloat r, g, b, a;
+    if (!sm_readColor(color, &r, &g, &b, &a) || a < 0.85) return NO;
+    CGFloat maxv = MAX(r, MAX(g, b));
+    CGFloat minv = MIN(r, MIN(g, b));
+    return maxv > 0.04 && maxv < 0.30 && (maxv - minv) < 0.07;
+}
+
+static UIColor *sm_entryBackground(void) {
+    if (sm_flag(kColorCardOn)) return sm_savedColor(kColorCard, [UIColor colorWithWhite:0.11 alpha:1]);
+    if (sm_amoled()) return [UIColor blackColor];
+    return g_plateColor ?: [UIColor secondarySystemGroupedBackgroundColor];
+}
+
+static UIColor *sm_entryForeground(void) {
+    if (sm_flag(kColorTextOn)) return sm_savedColor(kColorText, [UIColor whiteColor]);
+    return [UIColor labelColor];
+}
+
+static void sm_samplePlate(UIView *root) {
+    if (!root) return;
+    __block UIColor *color = nil;
+    __block CGFloat radius = 0;
+    __block CGFloat bestArea = 0;
+    __block void (^walk)(UIView *);
+    walk = ^(UIView *view) {
+        if (!view || view.tag == kEntryTag || view.tag == kGhostTag || view.tag == kThemeTag) return;
+        CGFloat width = view.bounds.size.width;
+        CGFloat height = view.bounds.size.height;
+        if (width > root.bounds.size.width * 0.72 && height >= 44 && height <= 96 && view.layer.cornerRadius >= 10) {
+            CGFloat area = width * height;
+            if (sm_isDarkGray(view.backgroundColor) && area > bestArea) {
+                color = view.backgroundColor;
+                radius = view.layer.cornerRadius;
+                bestArea = area;
+            }
+        }
+        for (UIView *sub in view.subviews) walk(sub);
+    };
+    walk(root);
+    if (color) {
+        g_plateColor = color;
+        if (radius >= 10 && radius <= 28) g_plateRadius = radius;
+    }
+}
+
+static void sm_scheduleTheme(void);
+
 @interface SMDockEntry : UIControl
 @property (nonatomic, weak) UIViewController *owner;
 @end
 
 @interface SMDockEditor : UITableViewController
 @property (nonatomic, strong) NSMutableArray<NSString *> *titles;
+@property (nonatomic, strong) NSMutableArray<NSString *> *hiddenTitles;
 @end
 
 static void presentEditor(UIViewController *from);
 static void presentGhost(UIViewController *from);
+static void presentTheme(UIViewController *from);
 
 @implementation SMDockEntry
 
@@ -530,12 +693,13 @@ static void presentGhost(UIViewController *from);
 
 - (void)layoutSubviews {
     [super layoutSubviews];
-    UIColor *foreground = [UIColor labelColor];
-    self.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
+    UIColor *foreground = sm_entryForeground();
+    self.backgroundColor = sm_entryBackground();
+    self.layer.cornerRadius = g_plateRadius;
     ((UIImageView *)[self viewWithTag:1]).tintColor = foreground;
     UILabel *title = (UILabel *)[self viewWithTag:2];
     title.textColor = foreground;
-    ((UIImageView *)[self viewWithTag:4]).tintColor = [UIColor tertiaryLabelColor];
+    ((UIImageView *)[self viewWithTag:4]).tintColor = [foreground colorWithAlphaComponent:0.45];
     [self viewWithTag:1].frame = CGRectMake(16, (self.bounds.size.height - 24) / 2.0, 24, 24);
     [self viewWithTag:4].frame = CGRectMake(self.bounds.size.width - 28, (self.bounds.size.height - 14) / 2.0, 12, 14);
     title.frame = CGRectMake(56, 0, self.bounds.size.width - 96, self.bounds.size.height);
@@ -548,6 +712,7 @@ static void presentGhost(UIViewController *from);
 
 - (void)open {
     if (self.tag == kGhostTag) presentGhost(self.owner);
+    else if (self.tag == kThemeTag) presentTheme(self.owner);
     else presentEditor(self.owner);
 }
 
@@ -564,6 +729,7 @@ static void presentGhost(UIViewController *from);
     self.tableView.editing = YES;
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(done)];
     if (!self.titles) self.titles = [NSMutableArray array];
+    if (!self.hiddenTitles) self.hiddenTitles = [NSMutableArray array];
 }
 
 - (void)done {
@@ -586,26 +752,31 @@ static void presentGhost(UIViewController *from);
     styleAllBars();
 }
 
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 2; }
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 3; }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return section == 0 ? 3 : self.titles.count;
+    if (section == 0) return 3;
+    if (section == 1) return self.titles.count;
+    return self.hiddenTitles.count;
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
-    return section == 0 ? @"Опции" : @"Порядок";
+    if (section == 0) return @"Опции";
+    if (section == 1) return @"Порядок";
+    return @"Скрытые";
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     if (section == 0) return @"Стекло включается после полного перезапуска. Если меню зависает, выключи его.";
-    return section == 1 ? @"Удерживайте полоски справа и перетаскивайте вкладки." : nil;
+    if (section == 1) return @"Удерживай полоски, чтобы поменять местами. Минус убирает вкладку. Настройки остаются.";
+    return @"Плюс возвращает вкладку в док.";
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"c"];
     if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"c"];
-    cell.backgroundColor = [UIColor colorWithWhite:0.14 alpha:1];
-    cell.textLabel.textColor = [UIColor whiteColor];
+    cell.backgroundColor = sm_entryBackground();
+    cell.textLabel.textColor = sm_entryForeground();
     cell.selectionStyle = UITableViewCellSelectionStyleNone;
     UISwitch *toggle = [cell.contentView viewWithTag:9];
     if (indexPath.section == 0) {
@@ -633,8 +804,11 @@ static void presentGhost(UIViewController *from);
         toggle.hidden = NO;
         toggle.on = on;
         objc_setAssociatedObject(toggle, "sm_row", @(indexPath.row), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    } else {
+    } else if (indexPath.section == 1) {
         cell.textLabel.text = self.titles[indexPath.row];
+        toggle.hidden = YES;
+    } else {
+        cell.textLabel.text = self.hiddenTitles[indexPath.row];
         toggle.hidden = YES;
     }
     return cell;
@@ -657,12 +831,42 @@ static void presentGhost(UIViewController *from);
     styleAllBars();
 }
 
+- (BOOL)tableView:(UITableView *)tableView canEditRowAtIndexPath:(NSIndexPath *)indexPath {
+    return indexPath.section != 0;
+}
+
 - (UITableViewCellEditingStyle)tableView:(UITableView *)tableView editingStyleForRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (indexPath.section == 1) {
+        NSString *title = self.titles[indexPath.row];
+        if (tabIsProtected(title) || self.titles.count <= 1) return UITableViewCellEditingStyleNone;
+        return UITableViewCellEditingStyleDelete;
+    }
+    if (indexPath.section == 2) return UITableViewCellEditingStyleInsert;
     return UITableViewCellEditingStyleNone;
 }
 
+- (void)tableView:(UITableView *)tableView commitEditingStyle:(UITableViewCellEditingStyle)editingStyle forRowAtIndexPath:(NSIndexPath *)indexPath {
+    if (editingStyle == UITableViewCellEditingStyleDelete && indexPath.section == 1) {
+        NSString *title = self.titles[indexPath.row];
+        [self.titles removeObjectAtIndex:indexPath.row];
+        [self.hiddenTitles addObject:title];
+        [hiddenTabs() addObject:title];
+    } else if (editingStyle == UITableViewCellEditingStyleInsert && indexPath.section == 2) {
+        NSString *title = self.hiddenTitles[indexPath.row];
+        [self.hiddenTitles removeObjectAtIndex:indexPath.row];
+        [self.titles addObject:title];
+        [hiddenTabs() removeObject:title];
+    } else {
+        return;
+    }
+    saveHidden();
+    saveOrder(self.titles);
+    [tableView reloadData];
+    styleAllBars();
+}
+
 - (BOOL)tableView:(UITableView *)tableView shouldIndentWhileEditingRowAtIndexPath:(NSIndexPath *)indexPath {
-    return NO;
+    return indexPath.section != 0;
 }
 
 @end
@@ -680,13 +884,32 @@ static void presentEditor(UIViewController *from) {
     if (!from) from = topController();
     if (!from) return;
     NSMutableArray *titles = [NSMutableArray array];
+    NSMutableArray *hidden = [NSMutableArray array];
+    NSMutableSet *seen = [NSMutableSet set];
     for (UIView *item in tabItems(locateBar())) {
         NSString *title = titleOfItem(item);
-        if (title.length) [titles addObject:title];
+        if (!title.length || [seen containsObject:title]) continue;
+        [seen addObject:title];
+        if (tabIsHidden(title)) [hidden addObject:title];
+        else [titles addObject:title];
     }
-    if (titles.count == 0 && savedOrder().count) titles = [savedOrder() mutableCopy];
+    for (NSString *title in hiddenTabs()) {
+        if ([seen containsObject:title] || tabIsProtected(title)) continue;
+        [seen addObject:title];
+        [hidden addObject:title];
+    }
+    if (titles.count == 0 && savedOrder().count) {
+        for (NSString *title in savedOrder()) {
+            if (tabIsHidden(title)) {
+                if (![hidden containsObject:title]) [hidden addObject:title];
+            } else {
+                [titles addObject:title];
+            }
+        }
+    }
     SMDockEditor *editor = [[SMDockEditor alloc] init];
     editor.titles = titles;
+    editor.hiddenTitles = hidden;
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:editor];
     nav.modalPresentationStyle = UIModalPresentationPageSheet;
     nav.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
@@ -737,8 +960,8 @@ static void presentEditor(UIViewController *from) {
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"g"];
     if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"g"];
-    cell.backgroundColor = [UIColor colorWithWhite:0.14 alpha:1];
-    cell.textLabel.textColor = [UIColor whiteColor];
+    cell.backgroundColor = sm_entryBackground();
+    cell.textLabel.textColor = sm_entryForeground();
     cell.textLabel.numberOfLines = 1;
     cell.detailTextLabel.textColor = [UIColor colorWithWhite:1 alpha:0.55];
     cell.detailTextLabel.numberOfLines = 0;
@@ -792,6 +1015,150 @@ static void presentGhost(UIViewController *from) {
     [from presentViewController:nav animated:YES completion:nil];
 }
 
+@interface SMThemeEditor : UITableViewController <UIColorPickerViewControllerDelegate>
+@property (nonatomic, assign) NSInteger pickingRow;
+@end
+
+@implementation SMThemeEditor
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"Тема";
+    self.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
+    self.tableView = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStyleInsetGrouped];
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(done)];
+}
+
+- (void)done {
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 2; }
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    return section == 0 ? 1 : 4;
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
+    return section == 0 ? @"AMOLED" : @"Своя";
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
+    if (section == 0) return @"Серые фоны становятся чёрными. Обои и цветные пузыри не меняются.";
+    return @"Пока переключатель выключен, цвет не трогаем. Включи его и нажми кружок.";
+}
+
+- (NSString *)sm_title:(NSInteger)row {
+    switch (row) {
+        case 0: return @"Фон";
+        case 1: return @"Плашки";
+        case 2: return @"Док";
+        default: return @"Текст";
+    }
+}
+
+- (NSString *)sm_onKey:(NSInteger)row {
+    switch (row) {
+        case 0: return kColorBgOn;
+        case 1: return kColorCardOn;
+        case 2: return kColorDockOn;
+        default: return kColorTextOn;
+    }
+}
+
+- (NSString *)sm_colorKey:(NSInteger)row {
+    switch (row) {
+        case 0: return kColorBg;
+        case 1: return kColorCard;
+        case 2: return kColorDock;
+        default: return kColorText;
+    }
+}
+
+- (UIColor *)sm_fallback:(NSInteger)row {
+    switch (row) {
+        case 0: return [UIColor blackColor];
+        case 1: return [UIColor colorWithWhite:0.11 alpha:1];
+        case 2: return [UIColor colorWithWhite:0.12 alpha:1];
+        default: return [UIColor whiteColor];
+    }
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"t"];
+    if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"t"];
+    cell.backgroundColor = sm_entryBackground();
+    cell.textLabel.textColor = sm_entryForeground();
+    cell.selectionStyle = UITableViewCellSelectionStyleNone;
+    if (indexPath.section == 0) {
+        cell.textLabel.text = @"Чёрный фон";
+        UISwitch *toggle = [[UISwitch alloc] init];
+        toggle.on = sm_amoled();
+        toggle.tag = 0;
+        [toggle addTarget:self action:@selector(amoledChanged:) forControlEvents:UIControlEventValueChanged];
+        cell.accessoryView = toggle;
+        return cell;
+    }
+    NSInteger row = indexPath.row;
+    cell.textLabel.text = [self sm_title:row];
+    UIView *box = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 96, 32)];
+    UIButton *dot = [UIButton buttonWithType:UIButtonTypeSystem];
+    dot.frame = CGRectMake(0, 2, 28, 28);
+    dot.tag = row;
+    dot.backgroundColor = sm_savedColor([self sm_colorKey:row], [self sm_fallback:row]);
+    dot.layer.cornerRadius = 14;
+    dot.layer.borderWidth = 1;
+    dot.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.25].CGColor;
+    [dot addTarget:self action:@selector(pickColor:) forControlEvents:UIControlEventTouchUpInside];
+    [box addSubview:dot];
+    UISwitch *toggle = [[UISwitch alloc] initWithFrame:CGRectMake(38, 0, 0, 0)];
+    toggle.on = sm_flag([self sm_onKey:row]);
+    toggle.tag = row;
+    [toggle addTarget:self action:@selector(colorSwitch:) forControlEvents:UIControlEventValueChanged];
+    [box addSubview:toggle];
+    cell.accessoryView = box;
+    return cell;
+}
+
+- (void)amoledChanged:(UISwitch *)sender {
+    [[NSUserDefaults standardUserDefaults] setBool:sender.on forKey:kAmoledKey];
+    sm_scheduleTheme();
+    [self.tableView reloadData];
+}
+
+- (void)colorSwitch:(UISwitch *)sender {
+    [[NSUserDefaults standardUserDefaults] setBool:sender.on forKey:[self sm_onKey:sender.tag]];
+    sm_scheduleTheme();
+}
+
+- (void)pickColor:(UIButton *)sender {
+    self.pickingRow = sender.tag;
+    UIColorPickerViewController *picker = [[UIColorPickerViewController alloc] init];
+    picker.delegate = self;
+    picker.supportsAlpha = NO;
+    picker.selectedColor = sm_savedColor([self sm_colorKey:sender.tag], [self sm_fallback:sender.tag]);
+    picker.title = [self sm_title:sender.tag];
+    [self presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)colorPickerViewController:(UIColorPickerViewController *)viewController didSelectColor:(UIColor *)color continuously:(BOOL)continuously {
+    sm_storeColor([self sm_colorKey:self.pickingRow], color);
+    if (sm_flag([self sm_onKey:self.pickingRow])) sm_scheduleTheme();
+    if (!continuously) [self.tableView reloadData];
+}
+
+@end
+
+static void presentTheme(UIViewController *from) {
+    if (!from) from = topController();
+    if (!from) return;
+    SMThemeEditor *editor = [[SMThemeEditor alloc] init];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:editor];
+    nav.modalPresentationStyle = UIModalPresentationPageSheet;
+    nav.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
+    [from presentViewController:nav animated:YES completion:nil];
+}
+
 static UIScrollView *findMainScroll(UIView *view) {
     UIScrollView *best = nil;
     CGFloat bestHeight = 0;
@@ -818,6 +1185,7 @@ static void installSettingsEntry(UIViewController *vc) {
         g_inSettings = NO;
         return;
     }
+    sm_samplePlate(vc.view);
 
     SMDockEntry *entry = (SMDockEntry *)[scroll viewWithTag:kEntryTag];
     if (!entry) {
@@ -839,14 +1207,26 @@ static void installSettingsEntry(UIViewController *vc) {
     }
     ghost.layer.zPosition = 50;
 
+    SMDockEntry *theme = (SMDockEntry *)[scroll viewWithTag:kThemeTag];
+    if (!theme) {
+        theme = [[SMDockEntry alloc] initWithFrame:CGRectZero];
+        theme.tag = kThemeTag;
+        theme.owner = vc;
+        ((UILabel *)[theme viewWithTag:2]).text = @"Тема";
+        ((UIImageView *)[theme viewWithTag:1]).image = [UIImage systemImageNamed:@"paintpalette"];
+        [scroll addSubview:theme];
+    }
+    theme.layer.zPosition = 50;
+
     CGFloat width = scroll.bounds.size.width;
     CGFloat side = 16;
     CGFloat height = 52;
     CGFloat y = scroll.contentSize.height + 14;
     entry.frame = CGRectMake(side, y, width - side * 2, height);
     ghost.frame = CGRectMake(side, CGRectGetMaxY(entry.frame) + 10, width - side * 2, height);
+    theme.frame = CGRectMake(side, CGRectGetMaxY(ghost.frame) + 10, width - side * 2, height);
 
-    CGFloat extra = height * 2 + 46;
+    CGFloat extra = height * 3 + 56;
     NSNumber *base = objc_getAssociatedObject(scroll, "sm_baseBottom");
     if (!base) {
         base = @(scroll.contentInset.bottom);
@@ -861,6 +1241,7 @@ static void installSettingsEntry(UIViewController *vc) {
     }
     [scroll bringSubviewToFront:entry];
     [scroll bringSubviewToFront:ghost];
+    [scroll bringSubviewToFront:theme];
 
     g_inSettings = NO;
 }
@@ -889,6 +1270,63 @@ static BOOL sm_menuIsActive(void) {
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     return UIMenuController.sharedMenuController.isMenuVisible;
 #pragma clang diagnostic pop
+}
+
+static BOOL sm_themeActive(void) {
+    return sm_amoled() || sm_flag(kColorBgOn) || sm_flag(kColorCardOn) || sm_flag(kColorDockOn) || sm_flag(kColorTextOn);
+}
+
+static BOOL sm_labelInChrome(UIView *view) {
+    for (UIView *cursor = view; cursor; cursor = cursor.superview) {
+        if ([cursor isKindOfClass:[SMDockEntry class]]) return YES;
+        if (TabBarClass && [cursor isKindOfClass:TabBarClass]) return YES;
+    }
+    return NO;
+}
+
+static void sm_applyThemeNow(void) {
+    if (sm_menuIsActive() || !sm_themeActive()) return;
+    BOOL amoled = sm_amoled();
+    BOOL bgOn = sm_flag(kColorBgOn);
+    BOOL cardOn = sm_flag(kColorCardOn);
+    BOOL textOn = sm_flag(kColorTextOn);
+    UIColor *black = [UIColor blackColor];
+    UIColor *bg = sm_savedColor(kColorBg, black);
+    UIColor *card = sm_savedColor(kColorCard, [UIColor colorWithWhite:0.11 alpha:1]);
+    UIColor *text = sm_savedColor(kColorText, [UIColor whiteColor]);
+    for (UIWindow *window in allWindows()) {
+        NSMutableArray *stack = [NSMutableArray arrayWithObject:window];
+        while (stack.count) {
+            UIView *view = stack.lastObject;
+            [stack removeLastObject];
+            if (view.tag == kPillTag) continue;
+            if ([view isKindOfClass:[UIWindow class]] || [view isKindOfClass:[UITableView class]] || [view isKindOfClass:[UICollectionView class]]) {
+                if (!sm_isDarkGray(view.backgroundColor)) {
+                    // Leave clear and colored backgrounds alone, so a chat wallpaper stays.
+                } else if (bgOn) view.backgroundColor = bg;
+                else if (amoled) view.backgroundColor = black;
+            } else if ([view isKindOfClass:[UITableViewCell class]] || [view isKindOfClass:[SMDockEntry class]]) {
+                BOOL gray = sm_isDarkGray(view.backgroundColor);
+                if (cardOn && ([view isKindOfClass:[SMDockEntry class]] || gray)) view.backgroundColor = card;
+                else if (amoled && gray) view.backgroundColor = black;
+            }
+            if (textOn && [view isKindOfClass:[UILabel class]] && sm_labelInChrome(view)) {
+                ((UILabel *)view).textColor = text;
+            }
+            for (UIView *subview in view.subviews) [stack addObject:subview];
+        }
+    }
+}
+
+static void sm_scheduleTheme(void) {
+    if (!sm_themeActive()) return;
+    static NSTimeInterval stamp;
+    NSTimeInterval now = CACurrentMediaTime();
+    if (now - stamp < 0.4) return;
+    stamp = now;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        sm_applyThemeNow();
+    });
 }
 
 static void swizzled_layout(id self, SEL _cmd) {
