@@ -863,9 +863,32 @@ static BOOL isDockView(UIView *view) {
 
 static void sm_updateDeletedCell(UIView *cell);
 
+static BOOL g_inViewLayout;
+static char smTrashScheduleKey;
+
+static BOOL sm_menuIsActive(void) {
+    for (UIWindow *window in allWindows()) {
+        const char *name = class_getName(object_getClass(window));
+        if (name && (strstr(name, "ContextMenu") || strstr(name, "EditMenu") || strstr(name, "Preview") || strstr(name, "TextEffect") || strstr(name, "Callout") || strstr(name, "Platter"))) return YES;
+        for (UIView *subview in window.subviews) {
+            const char *subname = class_getName(object_getClass(subview));
+            if (!subname) continue;
+            if (strstr(subname, "ContextMenu") || strstr(subname, "EditMenu") || strstr(subname, "Preview") || strstr(subname, "Callout") || strstr(subname, "Platter") || strstr(subname, "ActionMenu") || strstr(subname, "MessageMenu") || strstr(subname, "TextSelection")) return YES;
+        }
+    }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    return UIMenuController.sharedMenuController.isMenuVisible;
+#pragma clang diagnostic pop
+}
+
 static void swizzled_layout(id self, SEL _cmd) {
     ((void (*)(id, SEL))orig_layout)(self, _cmd);
-    if ([self isKindOfClass:[UIView class]]) sm_updateDeletedCell((UIView *)self);
+    if ([self isKindOfClass:[UIView class]]) {
+        g_inViewLayout = YES;
+        sm_updateDeletedCell((UIView *)self);
+        g_inViewLayout = NO;
+    }
     if (g_inStyle || ![self isKindOfClass:[UIView class]] || !isDockView((UIView *)self)) return;
     g_inStyle = YES;
     styleTabBar((UIView *)self);
@@ -991,13 +1014,7 @@ static id swizzled_deleteLocal(id self, SEL _cmd, id messageIds, id chat) {
 }
 
 static void swizzled_setStatus(id self, SEL _cmd, NSUInteger status) {
-    if (keepDeleted() && status == 2 && smMessageClass && [self isKindOfClass:smMessageClass]) {
-        NSDictionary *snap = sm_snapshot(self);
-        if (snap) sm_rememberSnapshot(snap);
-        else sm_rememberDeletedText(sm_messageBody(self));
-        sm_refreshDeletedLooks();
-        return;
-    }
+    if (keepDeleted() && status == 2 && smMessageClass && [self isKindOfClass:smMessageClass]) return;
     ((void (*)(id, SEL, NSUInteger))orig_setStatus)(self, _cmd, status);
 }
 
@@ -1402,17 +1419,10 @@ static BOOL sm_isDeletedBody(NSString *text) {
     NSString *trimmed = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (trimmed.length == 0) return NO;
     if ([trimmed rangeOfString:@"❌"].location != NSNotFound) return YES;
+    if ([trimmed rangeOfString:@"—— было ——"].location != NSNotFound) return NO;
     sm_loadDeletedBodies();
     [smDeletedLock lock];
     BOOL hit = [smDeletedBodies containsObject:trimmed];
-    if (!hit && trimmed.length > 2) {
-        for (NSString *body in smDeletedBodies) {
-            if (body.length >= 2 && [trimmed rangeOfString:body].location != NSNotFound && trimmed.length <= body.length + 16) {
-                hit = YES;
-                break;
-            }
-        }
-    }
     [smDeletedLock unlock];
     return hit;
 }
@@ -1456,13 +1466,13 @@ static void sm_rememberDeletedText(NSString *text) {
     text = sm_stripDeletedMark(text);
     if (text.length == 0) return;
     sm_loadDeletedBodies();
-    NSArray<NSString *> *parts = [text componentsSeparatedByString:@"\n—— было ——\n"];
+    NSString *latest = [[text componentsSeparatedByString:@"\n—— было ——\n"] lastObject];
+    latest = [latest stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (latest.length == 0 || [smDeletedBodies containsObject:latest]) return;
     BOOL changed = NO;
     [smDeletedLock lock];
-    for (NSString *part in parts) {
-        NSString *trimmed = [part stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if (trimmed.length == 0 || [smDeletedBodies containsObject:trimmed]) continue;
-        [smDeletedBodies addObject:trimmed];
+    if (![smDeletedBodies containsObject:latest]) {
+        [smDeletedBodies addObject:latest];
         changed = YES;
     }
     while (smDeletedBodies.count > 400) [smDeletedBodies removeObjectAtIndex:0];
@@ -2073,7 +2083,6 @@ static UILabel *sm_timeLabel(UIView *view) {
 
 static BOOL sm_cellIsDeleted(UIView *cell) {
     if (!keepDeleted()) return NO;
-    if (sm_treeHasDeletedText(cell)) return YES;
     id message = sm_boundMessage(cell);
     if (!message) {
         for (UIView *subview in cell.subviews) {
@@ -2081,10 +2090,12 @@ static BOOL sm_cellIsDeleted(UIView *cell) {
             if (message) break;
         }
     }
-    if (!message) return NO;
-    if (sm_isKeptKey(sm_call(message, "primaryKey"))) return YES;
-    if (sm_isKeptServerId(sm_call(message, "serverId"))) return YES;
-    return sm_isDeletedBody(sm_messageBody(message));
+    if (message) {
+        if (sm_isKeptKey(sm_call(message, "primaryKey"))) return YES;
+        if (sm_isKeptServerId(sm_call(message, "serverId"))) return YES;
+        return NO;
+    }
+    return sm_treeHasDeletedText(cell);
 }
 
 static UIView *sm_messageBubble(UIView *cell) {
@@ -2146,6 +2157,19 @@ static void sm_stripVisibleMark(UIView *view) {
 
 static void sm_updateDeletedCell(UIView *cell) {
     if (!sm_isTopHistoryCell(cell)) return;
+    if (sm_menuIsActive()) return;
+    if (g_inViewLayout) {
+        if (objc_getAssociatedObject(cell, &smTrashScheduleKey)) return;
+        objc_setAssociatedObject(cell, &smTrashScheduleKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        __weak UIView *weakCell = cell;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIView *later = weakCell;
+            if (!later) return;
+            objc_setAssociatedObject(later, &smTrashScheduleKey, nil, OBJC_ASSOCIATION_ASSIGN);
+            if (!sm_menuIsActive()) sm_updateDeletedCell(later);
+        });
+        return;
+    }
     static char smTrashBusyKey;
     if (objc_getAssociatedObject(cell, &smTrashBusyKey)) return;
     objc_setAssociatedObject(cell, &smTrashBusyKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
