@@ -1208,6 +1208,8 @@ static void sm_loadDeletedBodies(void) {
     });
 }
 
+static NSString *const smDeletedMark = @"\u2060";
+
 static NSString *sm_withoutCross(NSString *text) {
     if (text.length == 0) return text;
     return [[text stringByReplacingOccurrencesOfString:@"❌ " withString:@""] stringByReplacingOccurrencesOfString:@"❌" withString:@""];
@@ -1215,16 +1217,18 @@ static NSString *sm_withoutCross(NSString *text) {
 
 static BOOL sm_isDeletedBody(NSString *text) {
     if (text.length == 0) return NO;
+    if ([text rangeOfString:smDeletedMark].location != NSNotFound) return YES;
+    if ([text rangeOfString:@"❌"].location != NSNotFound) return YES;
     NSString *trimmed = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (trimmed.length == 0) return NO;
-    if ([trimmed rangeOfString:@"❌"].location != NSNotFound) return YES;
     NSString *clean = [sm_withoutCross(trimmed) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    clean = [clean stringByReplacingOccurrencesOfString:smDeletedMark withString:@""];
     sm_loadDeletedBodies();
     [smDeletedLock lock];
     BOOL hit = [smDeletedBodies containsObject:trimmed] || [smDeletedBodies containsObject:clean];
     if (!hit && clean.length > 2) {
         for (NSString *body in smDeletedBodies) {
-            NSString *plain = [sm_withoutCross(body) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            NSString *plain = [[sm_withoutCross(body) stringByReplacingOccurrencesOfString:smDeletedMark withString:@""] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
             if (plain.length >= 2 && [clean rangeOfString:plain].location != NSNotFound && clean.length <= plain.length + 16) {
                 hit = YES;
                 break;
@@ -1459,12 +1463,14 @@ static void sm_prefixDeletedMark(id message) {
     NSString *text = nil;
     Ivar ivar = sm_textIvar(messageText, &text);
     if (text.length == 0) text = sm_messageBody(message);
-    if (text.length == 0 || [text rangeOfString:@"❌"].location == NSNotFound) return;
-    NSString *clean = sm_withoutCross(text);
+    text = sm_withoutCross(text);
+    text = [text stringByReplacingOccurrencesOfString:smDeletedMark withString:@""];
+    if (text.length == 0) return;
+    NSString *marked = [smDeletedMark stringByAppendingString:text];
     if (messageText && [messageText respondsToSelector:@selector(setText:)]) {
-        ((void (*)(id, SEL, id))objc_msgSend)(messageText, @selector(setText:), clean);
+        ((void (*)(id, SEL, id))objc_msgSend)(messageText, @selector(setText:), marked);
     } else if (ivar && messageText) {
-        object_setIvar(messageText, ivar, clean);
+        object_setIvar(messageText, ivar, marked);
     }
 }
 
@@ -1612,6 +1618,8 @@ static id sm_makeMessage(NSDictionary *rec) {
     NSString *text = [rec[@"text"] isKindOfClass:[NSString class]] ? rec[@"text"] : nil;
     if (text.length && textClass) {
         NSString *visible = sm_withoutCross(text);
+        visible = [visible stringByReplacingOccurrencesOfString:smDeletedMark withString:@""];
+        if (visible.length) visible = [smDeletedMark stringByAppendingString:visible];
         id allocated = ((id (*)(id, SEL))objc_msgSend)(textClass, @selector(alloc));
         id messageText = nil;
         if ([textClass instancesRespondToSelector:@selector(initWithText:)]) {
@@ -1847,6 +1855,59 @@ static UIView *sm_messageBubble(UIView *cell) {
     return best;
 }
 
+static BOOL sm_objectIsDeletedMessage(id object) {
+    if (!object) return NO;
+    const char *name = class_getName(object_getClass(object));
+    if (name && strstr(name, "OKMMessage") && !strstr(name, "Text")) {
+        if (sm_isKeptKey(sm_call(object, "primaryKey")) || sm_isKeptServerId(sm_call(object, "serverId"))) return YES;
+        if (sm_isDeletedBody(sm_messageBody(object))) return YES;
+    }
+    id message = sm_call(object, "message");
+    if (message && message != object && sm_objectIsDeletedMessage(message)) return YES;
+    return NO;
+}
+
+static BOOL sm_viewOwnsDeleted(UIView *view) {
+    Class cls = object_getClass(view);
+    while (cls && cls != [UIView class] && cls != [UIResponder class] && cls != [NSObject class]) {
+        unsigned int count = 0;
+        Ivar *ivars = class_copyIvarList(cls, &count);
+        for (unsigned int i = 0; i < count; i++) {
+            const char *type = ivar_getTypeEncoding(ivars[i]);
+            if (!type || type[0] != '@') continue;
+            id value = object_getIvar(view, ivars[i]);
+            if ([value isKindOfClass:[NSString class]] && sm_isDeletedBody(value)) {
+                free(ivars);
+                return YES;
+            }
+            if ([value isKindOfClass:[NSAttributedString class]] && sm_isDeletedBody(((NSAttributedString *)value).string)) {
+                free(ivars);
+                return YES;
+            }
+            if (sm_objectIsDeletedMessage(value)) {
+                free(ivars);
+                return YES;
+            }
+        }
+        free(ivars);
+        cls = class_getSuperclass(cls);
+    }
+    return NO;
+}
+
+static UIView *sm_namedView(UIView *view, const char *ivarName) {
+    Class cls = object_getClass(view);
+    while (cls) {
+        Ivar ivar = class_getInstanceVariable(cls, ivarName);
+        if (ivar) {
+            id value = object_getIvar(view, ivar);
+            if ([value isKindOfClass:[UIView class]]) return value;
+        }
+        cls = class_getSuperclass(cls);
+    }
+    return nil;
+}
+
 static BOOL sm_looksLikeTime(NSString *text) {
     if (text.length < 4 || text.length > 8) return NO;
     NSRange colon = [text rangeOfString:@":"];
@@ -1888,8 +1949,9 @@ static void sm_updateDeletedCell(UIView *cell) {
     static BOOL busy;
     if (busy) return;
     busy = YES;
-    BOOL deleted = keepDeleted() && sm_treeHasDeletedText(cell);
-    UIView *bubble = sm_messageBubble(cell);
+    BOOL deleted = keepDeleted() && (sm_treeHasDeletedText(cell) || sm_viewOwnsDeleted(cell));
+    UIView *bubble = sm_namedView(cell, "mainViewContainerView");
+    if (!bubble) bubble = sm_messageBubble(cell);
     UIView *existing = [cell viewWithTag:kDeletedBadgeTag];
     if (!deleted) {
         if (existing) [existing removeFromSuperview];
