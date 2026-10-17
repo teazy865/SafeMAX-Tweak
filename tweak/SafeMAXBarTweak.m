@@ -390,16 +390,8 @@ static CGRect chromeBounds(UIView *bar) {
 }
 
 static UIVisualEffect *makeGlass(void) {
-    Class cls = NSClassFromString(@"UIGlassEffect");
-    SEL factory = @selector(effectWithStyle:);
-    if (cls && [cls respondsToSelector:factory]) {
-        // UIGlassEffectStyleRegular. A plain -init paints a solid black or white fill.
-        id effect = ((id (*)(Class, SEL, NSInteger))objc_msgSend)(cls, factory, 0);
-        if ([effect respondsToSelector:@selector(setInteractive:)]) {
-            [effect setInteractive:YES];
-        }
-        if (effect) return effect;
-    }
+    // Ordinary blur, not UIGlassEffect. The system glass fill turns solid
+    // black or white unless the whole app is on the new design.
     return [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterial];
 }
 
@@ -462,13 +454,11 @@ static void styleTabBar(UIView *bar) {
     pill.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:pill.bounds cornerRadius:height / 2.0].CGPath;
     UIVisualEffectView *glass = (UIVisualEffectView *)[pill viewWithTag:7];
     glass.frame = pill.bounds;
-    if (!objc_getAssociatedObject(glass, "sm_glass")) {
-        objc_setAssociatedObject(glass, "sm_glass", @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (![glass.effect isKindOfClass:[UIBlurEffect class]]) {
         glass.backgroundColor = [UIColor clearColor];
-        glass.clipsToBounds = NO;
-        glass.layer.cornerRadius = 0;
         glass.effect = makeGlass();
     }
+    glass.clipsToBounds = YES;
     glass.layer.cornerRadius = height / 2.0;
     glass.layer.cornerCurve = kCACornerCurveCircular;
     [bar sendSubviewToBack:pill];
