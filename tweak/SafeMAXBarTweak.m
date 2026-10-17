@@ -2084,15 +2084,62 @@ static id sm_chatServiceFrom(id owner) {
     return service ?: smChatService;
 }
 
+static id g_chatLookupId;
+static id g_chatLookupChat;
+
+static void sm_chat_lookup_invoke(void *block, id transaction) {
+    (void)block;
+    SEL sel = sel_registerName("okm_chatForChatId:");
+    if (![transaction respondsToSelector:sel]) return;
+    @try {
+        g_chatLookupChat = ((id (*)(id, SEL, id))objc_msgSend)(transaction, sel, g_chatLookupId);
+    } @catch (__unused NSException *exception) {
+        g_chatLookupChat = nil;
+    }
+}
+
+static id sm_chatLookupBlock(void) {
+    static SMBlockLiteral block;
+    static struct { unsigned long reserved; unsigned long size; const char *signature; const char *layout; } desc;
+    static dispatch_once_t once;
+    static BOOL ready;
+    dispatch_once(&once, ^{
+        void *isa = dlsym(RTLD_DEFAULT, "_NSConcreteGlobalBlock");
+        if (!isa) return;
+        desc.size = sizeof(block);
+        desc.signature = "v16@?0@8";
+        desc.layout = "\0";
+        block.isa = isa;
+        block.flags = (1 << 28) | (1 << 30);
+        block.invoke = (void *)sm_chat_lookup_invoke;
+        block.descriptor = &desc;
+        ready = YES;
+    });
+    return ready ? (__bridge id)&block : nil;
+}
+
+static BOOL sm_isChatObject(id obj) {
+    const char *name = obj ? class_getName(object_getClass(obj)) : NULL;
+    return name && strcmp(name, "OKMChat") == 0;
+}
+
 static id sm_cachedChat(id service, id chatId) {
     if (!service || !chatId) return nil;
-    SEL cached = sel_registerName("cachedChatWithId:");
-    if (![service respondsToSelector:cached]) return nil;
+    id connection = sm_call(service, "readConnection");
+    if (!connection) connection = sm_call(service, "dbConnection");
+    id block = sm_chatLookupBlock();
+    if (!connection || !block || ![connection respondsToSelector:@selector(readWithBlock:)]) return nil;
+    g_chatLookupId = chatId;
+    g_chatLookupChat = nil;
     @try {
-        return ((id (*)(id, SEL, id))objc_msgSend)(service, cached, chatId);
+        ((void (*)(id, SEL, id))objc_msgSend)(connection, @selector(readWithBlock:), block);
     } @catch (__unused NSException *exception) {
-        return nil;
+        g_chatLookupChat = nil;
     }
+    id chat = g_chatLookupChat;
+    g_chatLookupId = nil;
+    g_chatLookupChat = nil;
+    return sm_isChatObject(chat) ? chat : nil;
 }
 
 static BOOL sm_pkMuted(id service, id pk) {
@@ -2124,7 +2171,8 @@ static void sm_postIncoming(id note, id owner) {
     id chatId = sm_call(note, "chatId");
     if (!chatId) chatId = sm_call(message, "chatId");
     id chat = sm_call(note, "chat");
-    if (!chat) chat = sm_call(message, "chat");
+    if (!sm_isChatObject(chat)) chat = sm_call(message, "chat");
+    if (!sm_isChatObject(chat)) chat = nil;
     if (!chatId) chatId = sm_call(chat, "chatId");
     if (!chat) chat = sm_cachedChat(service, chatId);
     if (sm_chatMuted(service, chat)) return;
