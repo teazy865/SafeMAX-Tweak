@@ -54,23 +54,43 @@ jobs:
           import os, plistlib
           from pathlib import Path
           app = Path(os.environ["APP"])
+          def clean(value):
+              if isinstance(value, str):
+                  new = value.replace("SafeMAX", "Max").replace("SAFEMAX", "Max").replace("SafeMax", "Max")
+                  if "t.me/safemax_mod" in value:
+                      new = new.replace("https://t.me/safemax_mod", "").replace("t.me/safemax_mod", "").strip(" |")
+                  return new, new != value
+              if isinstance(value, list):
+                  changed = False
+                  for i, item in enumerate(value):
+                      item, item_changed = clean(item)
+                      if item_changed:
+                          value[i] = item
+                          changed = True
+                  return value, changed
+              if isinstance(value, dict):
+                  changed = False
+                  if "safemax_mod" in value:
+                      del value["safemax_mod"]
+                      changed = True
+                  for key, item in list(value.items()):
+                      item, item_changed = clean(item)
+                      if item_changed:
+                          value[key] = item
+                          changed = True
+                  title = value.get("ABOUT_SETTINGS_VERSION_TITLE")
+                  if isinstance(title, str) and "|" in title:
+                      value["ABOUT_SETTINGS_VERSION_TITLE"] = title.split("|", 1)[0].strip()
+                      changed = True
+                  return value, changed
+              return value, False
           def patch(path):
               raw = path.read_bytes()
               try:
                   data = plistlib.loads(raw)
               except Exception:
                   return
-              if not isinstance(data, dict):
-                  return
-              changed = False
-              for key in ("CFBundleDisplayName", "CFBundleName"):
-                  if key in data and data[key] != "Max":
-                      data[key] = "Max"
-                      changed = True
-              title = data.get("ABOUT_SETTINGS_VERSION_TITLE")
-              if isinstance(title, str) and "t.me" in title:
-                  data["ABOUT_SETTINGS_VERSION_TITLE"] = title.split("|", 1)[0].strip()
-                  changed = True
+              data, changed = clean(data)
               if changed:
                   fmt = plistlib.FMT_BINARY if raw.startswith(b"bplist") else plistlib.FMT_XML
                   path.write_bytes(plistlib.dumps(data, fmt=fmt))
