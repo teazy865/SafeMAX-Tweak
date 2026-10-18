@@ -1361,6 +1361,7 @@ static void sm_markIdsInOpenPages(id ids) {
             for (id item in items) {
                 if (!sm_sameId(message, item)) continue;
                 sm_flagDeleted(message);
+                sm_keepLive(message);
                 sm_rememberSnapshot(sm_snapshot(message));
                 sm_prefixDeletedMark(message);
             }
@@ -2020,6 +2021,7 @@ static void sm_noteDeletedPayload(id ids, id chat, id serviceOwner) {
         sm_rememberSnapshot(rich);
     }
     for (id message in messages) {
+        sm_keepLive(message);
         sm_prefixDeletedMark(message);
         sm_writeMarkedMessage(connection, message);
     }
@@ -2053,14 +2055,21 @@ static void sm_keepLive(id message) {
         if ([cpk isKindOfClass:[NSString class]] && [(NSString *)cpk length]) chat = cpk;
     }
     NSString *key = sm_msgKey(message);
-    if (!chat.length || !key.length) return;
+    if (!key.length) return;
     if (!smLiveKept) smLiveKept = [NSMutableDictionary dictionary];
-    NSMutableDictionary *bucket = smLiveKept[chat];
-    if (!bucket) {
-        bucket = [NSMutableDictionary dictionary];
-        smLiveKept[chat] = bucket;
+    NSMutableArray<NSString *> *chats = [NSMutableArray array];
+    if (chat.length) [chats addObject:chat];
+    id cpk = sm_call(message, "chatPrimaryKey");
+    if ([cpk isKindOfClass:[NSString class]] && [(NSString *)cpk length] && ![chats containsObject:cpk]) [chats addObject:cpk];
+    if (chats.count == 0) [chats addObject:@"*"];
+    for (NSString *name in chats) {
+        NSMutableDictionary *bucket = smLiveKept[name];
+        if (!bucket) {
+            bucket = [NSMutableDictionary dictionary];
+            smLiveKept[name] = bucket;
+        }
+        bucket[key] = message;
     }
-    bucket[key] = message;
 }
 
 static NSString *sm_msgKey(id message) {
@@ -2196,20 +2205,28 @@ static id sm_mergeKeptInto(id page, id messages) {
         }
     }
     NSMutableArray *extra = [NSMutableArray array];
-    NSDictionary *live = chatKey.length ? [smLiveKept[chatKey] copy] : nil;
-    for (NSString *key in live) {
-        if ([seen containsObject:key]) continue;
-        id message = live[key];
-        if (!message) continue;
-        long long ts = sm_callLL(message, "timestampAsInt");
-        BOOL inRange = ts && minTs != LLONG_MAX && ts >= minTs && ts <= maxTs;
-        BOOL tail = tailPage && (!ts || ts >= maxTs);
-        if (!inRange && !tail) continue;
-        [extra addObject:message];
-        [seen addObject:key];
+    NSMutableArray *buckets = [NSMutableArray array];
+    if (chatKey.length && smLiveKept[chatKey]) [buckets addObject:smLiveKept[chatKey]];
+    id sampleKey = sm_call(sample, "chatPrimaryKey");
+    if ([sampleKey isKindOfClass:[NSString class]] && smLiveKept[sampleKey] && ![sampleKey isEqual:chatKey]) [buckets addObject:smLiveKept[sampleKey]];
+    if (smLiveKept[@"*"]) [buckets addObject:smLiveKept[@"*"]];
+    for (NSDictionary *live in buckets) {
+        for (NSString *key in live) {
+            if ([seen containsObject:key]) continue;
+            id message = live[key];
+            if (!message) continue;
+            long long ts = sm_callLL(message, "timestampAsInt");
+            BOOL inRange = ts && minTs != LLONG_MAX && ts >= minTs && ts <= maxTs;
+            BOOL tail = tailPage && (!ts || ts >= maxTs);
+            if (!inRange && !tail) continue;
+            [extra addObject:message];
+            [seen addObject:key];
+        }
     }
     for (NSDictionary *rec in recs) {
-        if (![rec isKindOfClass:[NSDictionary class]] || !sm_sameChat(rec, sample)) continue;
+        if (![rec isKindOfClass:[NSDictionary class]]) continue;
+        BOOL unnamed = ![rec[@"cid"] respondsToSelector:@selector(longLongValue)] && ![rec[@"cpk"] isKindOfClass:[NSString class]];
+        if (!sm_sameChat(rec, sample) && !(unnamed && tailPage)) continue;
         NSString *pk = [rec[@"pk"] isKindOfClass:[NSString class]] ? rec[@"pk"] : nil;
         long long sid = [rec[@"sid"] longLongValue];
         if (pk.length && [seen containsObject:pk]) continue;
