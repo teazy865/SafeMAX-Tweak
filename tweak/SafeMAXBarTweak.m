@@ -2902,6 +2902,8 @@ static BOOL (*orig_storiesEnabled)(id, SEL);
 static void (*orig_storyApply)(id, SEL, id);
 static void (*orig_storyLayout)(id, SEL);
 static id (*orig_storyResponse)(id, SEL, id, unsigned short, BOOL, id, id);
+static NSInteger (*orig_storySections)(id, SEL, id);
+static void (*orig_storySelect)(id, SEL, id, id);
 static NSArray<NSNumber *> *g_storyOwnerIds;
 static NSMutableDictionary<NSNumber *, NSString *> *g_storyNames;
 static NSMutableDictionary<NSNumber *, UIImage *> *g_storyImages;
@@ -3094,6 +3096,44 @@ static void swizzled_storyLayout(id self, SEL _cmd) {
     sm_fillStoryCell(self);
 }
 
+static id sm_storyRouter(UIView *view) {
+    NSMutableArray<UIViewController *> *stack = [NSMutableArray array];
+    UIResponder *responder = view;
+    while (responder && stack.count < 12) {
+        if ([responder isKindOfClass:[UIViewController class]]) [stack addObject:(UIViewController *)responder];
+        responder = responder.nextResponder;
+    }
+    for (UIWindow *window in allWindows()) {
+        UIViewController *root = window.rootViewController;
+        if (root) [stack addObject:root];
+    }
+    for (NSUInteger i = 0; i < stack.count && i < 40; i++) {
+        UIViewController *controller = stack[i];
+        const char *name = class_getName(object_getClass(controller));
+        if (name && strstr(name, "ChatListContainer")) {
+            id router = sm_ivarObject(sm_ivarObject(controller, "model"), "router");
+            if ([router respondsToSelector:sel_registerName("startStoryCreation")]) return router;
+        }
+        if (controller.presentedViewController) [stack addObject:controller.presentedViewController];
+        for (UIViewController *child in controller.childViewControllers) [stack addObject:child];
+    }
+    return nil;
+}
+
+static NSInteger swizzled_storySections(id self, SEL _cmd, id collectionView) {
+    return 1;
+}
+
+static void swizzled_storySelect(id self, SEL _cmd, id collectionView, id path) {
+    id router = sm_storyRouter([collectionView isKindOfClass:[UIView class]] ? collectionView : nil);
+    SEL start = sel_registerName("startStoryCreation");
+    if ([router respondsToSelector:start]) {
+        ((void (*)(id, SEL))objc_msgSend)(router, start);
+        return;
+    }
+    if (orig_storySelect) orig_storySelect(self, _cmd, collectionView, path);
+}
+
 static void hookStories(void) {
     Class storage = objc_getClass("_TtC23OKMAppMessengerProtocol18OMPMSConfigStorage");
     sm_hook_own(storage, "storiesEnabled", (IMP)swizzled_storiesEnabled, (IMP *)&orig_storiesEnabled);
@@ -3102,6 +3142,9 @@ static void hookStories(void) {
     sm_hook_own(cell, "layoutSubviews", (IMP)swizzled_storyLayout, (IMP *)&orig_storyLayout);
     Class client = objc_getClass("OKMMessengerClient");
     sm_hook_own(client, "_onSendDataResponse:command:isErrorAck:error:resultBlock:", (IMP)swizzled_storyResponse, (IMP *)&orig_storyResponse);
+    Class stories = objc_getClass("_TtC7Stories31StoriesCollectionViewController");
+    sm_hook_own(stories, "numberOfSectionsInCollectionView:", (IMP)swizzled_storySections, (IMP *)&orig_storySections);
+    sm_hook_own(stories, "collectionView:didSelectItemAtIndexPath:", (IMP)swizzled_storySelect, (IMP *)&orig_storySelect);
 }
 
 static void hookLiquidGlassFlag(void);
