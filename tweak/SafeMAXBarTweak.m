@@ -1182,6 +1182,7 @@ static void sm_updateDeletedCell(UIView *cell);
 static NSDictionary *sm_snapshot(id message);
 static void sm_rememberSnapshot(NSDictionary *snap);
 static void sm_noteHistoryPage(id value);
+static void sm_keepLive(id message);
 static void sm_captureOpenPages(void);
 static void sm_reloadHistory(void);
 static void sm_keepInsteadOfDelete(id service, id ids);
@@ -1211,6 +1212,7 @@ static BOOL sm_flaggedDeleted(id message) {
 static void swizzled_setStatus(id self, SEL _cmd, NSUInteger status) {
     if (keepDeleted() && status == 2 && smMessageClass && [self isKindOfClass:smMessageClass]) {
         NSDictionary *snap = sm_snapshot(self);
+        sm_keepLive(self);
         if (snap) sm_rememberSnapshot(snap);
         else sm_rememberDeletedText(sm_messageBody(self));
         sm_refreshDeletedLooks();
@@ -2036,6 +2038,31 @@ static BOOL sm_sameChat(NSDictionary *rec, id sample) {
     return NO;
 }
 
+static NSMutableDictionary<NSString *, NSMutableDictionary<NSString *, id> *> *smLiveKept;
+
+static void sm_keepLive(id message);
+static NSString *sm_msgKey(id message);
+
+static void sm_keepLive(id message) {
+    if (!message || [message isKindOfClass:[NSString class]] || [message isKindOfClass:[NSNumber class]]) return;
+    id cid = sm_call(message, "chatId");
+    NSString *chat = nil;
+    if ([cid respondsToSelector:@selector(longLongValue)] && [cid longLongValue]) chat = [cid stringValue];
+    if (!chat.length) {
+        id cpk = sm_call(message, "chatPrimaryKey");
+        if ([cpk isKindOfClass:[NSString class]] && [(NSString *)cpk length]) chat = cpk;
+    }
+    NSString *key = sm_msgKey(message);
+    if (!chat.length || !key.length) return;
+    if (!smLiveKept) smLiveKept = [NSMutableDictionary dictionary];
+    NSMutableDictionary *bucket = smLiveKept[chat];
+    if (!bucket) {
+        bucket = [NSMutableDictionary dictionary];
+        smLiveKept[chat] = bucket;
+    }
+    bucket[key] = message;
+}
+
 static NSString *sm_msgKey(id message) {
     id pk = sm_call(message, "primaryKey");
     if ([pk isKindOfClass:[NSString class]] && [pk length]) return pk;
@@ -2169,6 +2196,18 @@ static id sm_mergeKeptInto(id page, id messages) {
         }
     }
     NSMutableArray *extra = [NSMutableArray array];
+    NSDictionary *live = chatKey.length ? [smLiveKept[chatKey] copy] : nil;
+    for (NSString *key in live) {
+        if ([seen containsObject:key]) continue;
+        id message = live[key];
+        if (!message) continue;
+        long long ts = sm_callLL(message, "timestampAsInt");
+        BOOL inRange = ts && minTs != LLONG_MAX && ts >= minTs && ts <= maxTs;
+        BOOL tail = tailPage && (!ts || ts >= maxTs);
+        if (!inRange && !tail) continue;
+        [extra addObject:message];
+        [seen addObject:key];
+    }
     for (NSDictionary *rec in recs) {
         if (![rec isKindOfClass:[NSDictionary class]] || !sm_sameChat(rec, sample)) continue;
         NSString *pk = [rec[@"pk"] isKindOfClass:[NSString class]] ? rec[@"pk"] : nil;
@@ -2426,19 +2465,6 @@ static void sm_stripVisibleMark(UIView *view) {
 
 static void sm_updateDeletedCell(UIView *cell) {
     if (!sm_isTopHistoryCell(cell)) return;
-    if (sm_menuIsActive()) return;
-    if (g_inViewLayout) {
-        if (objc_getAssociatedObject(cell, &smTrashScheduleKey)) return;
-        objc_setAssociatedObject(cell, &smTrashScheduleKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        __weak UIView *weakCell = cell;
-        dispatch_async(dispatch_get_main_queue(), ^{
-            UIView *later = weakCell;
-            if (!later) return;
-            objc_setAssociatedObject(later, &smTrashScheduleKey, nil, OBJC_ASSOCIATION_ASSIGN);
-            if (!sm_menuIsActive()) sm_updateDeletedCell(later);
-        });
-        return;
-    }
     static char smTrashBusyKey;
     if (objc_getAssociatedObject(cell, &smTrashBusyKey)) return;
     objc_setAssociatedObject(cell, &smTrashBusyKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
