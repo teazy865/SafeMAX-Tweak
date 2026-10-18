@@ -2776,8 +2776,6 @@ static NSData *sm_silentWav(void) {
     memcpy(bytes + 34, &bits, 2);
     memcpy(bytes + 36, "data", 4);
     memcpy(bytes + 40, &dataSize, 4);
-    int16_t *samples = (int16_t *)(bytes + 44);
-    for (uint32_t i = 0; i < frames; i++) samples[i] = (i & 32) ? 8 : -8;
     return data;
 }
 
@@ -2788,6 +2786,19 @@ static BOOL sm_audioBusy(void) {
 }
 
 static void sm_startSilentAudio(void) {
+    if (!bgNotify() || sm_audioBusy()) return;
+    NSError *error = nil;
+    AVAudioSession *session = [AVAudioSession sharedInstance];
+    [session setCategory:AVAudioSessionCategoryPlayback withOptions:AVAudioSessionCategoryOptionMixWithOthers error:&error];
+    [session setActive:YES error:&error];
+    if (!smSilentPlayer) {
+        smSilentPlayer = [[AVAudioPlayer alloc] initWithData:sm_silentWav() error:&error];
+        smSilentPlayer.numberOfLoops = -1;
+        smSilentPlayer.volume = 0.01;
+    }
+    if (smSilentPlayer && !smSilentPlayer.playing) [smSilentPlayer play];
+    smAudioOwned = smSilentPlayer.playing;
+    NSLog(@"[MaxBG] audio %@ err=%@", smSilentPlayer.playing ? @"playing" : @"idle", error);
 }
 
 static void sm_stopSilentAudio(void) {
@@ -2979,20 +2990,114 @@ static void swizzled_messageReceived(id self, SEL _cmd, id note) {
 static CLLocationManager *smLoc;
 static id smLocDelegate;
 static BOOL smLocRunning;
+static BOOL smFenceReady;
 
 static void sm_startLocation(void);
+static void sm_raiseSocket(void);
+static void sm_installFence(CLLocation *location);
+
+static const char *sm_authName(CLAuthorizationStatus status) {
+    switch (status) {
+        case kCLAuthorizationStatusNotDetermined: return "notDetermined";
+        case kCLAuthorizationStatusRestricted: return "restricted";
+        case kCLAuthorizationStatusDenied: return "denied";
+        case kCLAuthorizationStatusAuthorizedAlways: return "always";
+        case kCLAuthorizationStatusAuthorizedWhenInUse: return "whenInUse";
+        default: return "unknown";
+    }
+}
+
+static CLAuthorizationStatus sm_authStatus(void) {
+    if (smLoc && [smLoc respondsToSelector:@selector(authorizationStatus)]) return smLoc.authorizationStatus;
+    return [CLLocationManager authorizationStatus];
+}
+
+static id sm_clientIn(id root, int depth) {
+    Class want = objc_getClass("OKMMessengerClient");
+    if (!root || depth > 2 || !want) return nil;
+    if ([root isKindOfClass:[NSString class]] || [root isKindOfClass:[NSNumber class]] || [root isKindOfClass:[NSArray class]] || [root isKindOfClass:[NSDictionary class]]) return nil;
+    if ([root isKindOfClass:want]) return root;
+    Class cls = object_getClass(root);
+    NSMutableArray *kids = depth < 2 ? [NSMutableArray array] : nil;
+    while (cls && cls != [NSObject class]) {
+        unsigned int count = 0;
+        Ivar *ivars = class_copyIvarList(cls, &count);
+        for (unsigned int i = 0; ivars && i < count; i++) {
+            const char *enc = ivar_getTypeEncoding(ivars[i]);
+            if (!enc || enc[0] != '@') continue;
+            id value = object_getIvar(root, ivars[i]);
+            if (!value) continue;
+            if ([value isKindOfClass:want]) {
+                free(ivars);
+                return value;
+            }
+            if (kids && ![value isKindOfClass:[NSString class]] && ![value isKindOfClass:[NSNumber class]] && ![value isKindOfClass:[UIView class]]) [kids addObject:value];
+        }
+        free(ivars);
+        cls = class_getSuperclass(cls);
+    }
+    for (id kid in kids) {
+        id found = sm_clientIn(kid, depth + 1);
+        if (found) return found;
+    }
+    return nil;
+}
+
+static void sm_raiseSocket(void) {
+    id client = sm_clientIn(UIApplication.sharedApplication.delegate, 0);
+    SEL connect = sel_registerName("connectIfNeeded");
+    SEL plain = sel_registerName("connect");
+    if ([client respondsToSelector:connect]) {
+        ((void (*)(id, SEL))objc_msgSend)(client, connect);
+        NSLog(@"[MaxBG] socket connectIfNeeded");
+        return;
+    }
+    if ([client respondsToSelector:plain]) {
+        ((void (*)(id, SEL))objc_msgSend)(client, plain);
+        NSLog(@"[MaxBG] socket connect");
+        return;
+    }
+    NSLog(@"[MaxBG] socket client missing");
+}
+
+static void sm_installFence(CLLocation *location) {
+    if (!smLoc || !location) return;
+    if (![CLLocationManager isMonitoringAvailableForClass:[CLCircularRegion class]]) {
+        NSLog(@"[MaxBG] fence unavailable");
+        return;
+    }
+    CLCircularRegion *region = [[CLCircularRegion alloc] initWithCenter:location.coordinate radius:150 identifier:@"MaxBGFence"];
+    region.notifyOnExit = YES;
+    region.notifyOnEntry = NO;
+    for (CLRegion *old in smLoc.monitoredRegions) {
+        if ([old.identifier isEqualToString:@"MaxBGFence"]) [smLoc stopMonitoringForRegion:old];
+    }
+    [smLoc startMonitoringForRegion:region];
+    smFenceReady = YES;
+    NSLog(@"[MaxBG] fence lat=%.5f lon=%.5f radius=150", location.coordinate.latitude, location.coordinate.longitude);
+}
 
 @interface SMBgLocator : NSObject <CLLocationManagerDelegate>
 @end
 
 @implementation SMBgLocator
 - (void)locationManagerDidChangeAuthorization:(CLLocationManager *)manager {
-    (void)manager;
+    NSLog(@"[MaxBG] auth changed %s", sm_authName(manager.authorizationStatus));
     if (bgNotify()) sm_startLocation();
 }
 - (void)locationManager:(CLLocationManager *)manager didUpdateLocations:(NSArray<CLLocation *> *)locations {
+    if (smFenceReady) return;
+    sm_installFence(locations.lastObject);
     (void)manager;
-    (void)locations;
+}
+- (void)locationManager:(CLLocationManager *)manager didExitRegion:(CLRegion *)region {
+    NSLog(@"[MaxBG] didExitRegion %@", region.identifier);
+    smFenceReady = NO;
+    sm_raiseSocket();
+    sm_startSilentAudio();
+    CLLocation *location = manager.location;
+    if (location) sm_installFence(location);
+    else [manager requestLocation];
 }
 @end
 
@@ -3006,9 +3111,8 @@ static void sm_startLocation(void) {
         smLoc.distanceFilter = kCLDistanceFilterNone;
         smLoc.pausesLocationUpdatesAutomatically = NO;
     }
-    CLAuthorizationStatus status;
-    if ([smLoc respondsToSelector:@selector(authorizationStatus)]) status = smLoc.authorizationStatus;
-    else status = [CLLocationManager authorizationStatus];
+    CLAuthorizationStatus status = sm_authStatus();
+    NSLog(@"[MaxBG] location start auth=%s", sm_authName(status));
     if (status == kCLAuthorizationStatusNotDetermined) {
         static BOOL asked;
         if (!asked) {
@@ -3022,15 +3126,23 @@ static void sm_startLocation(void) {
     @try {
         smLoc.allowsBackgroundLocationUpdates = YES;
         [smLoc startUpdatingLocation];
+        [smLoc startMonitoringSignificantLocationChanges];
         smLocRunning = YES;
-    } @catch (__unused NSException *exception) {
+        NSLog(@"[MaxBG] significant updates on");
+    } @catch (NSException *exception) {
         smLocRunning = NO;
+        NSLog(@"[MaxBG] location failed %@", exception);
     }
 }
 
 static void sm_stopLocation(void) {
     [smLoc stopUpdatingLocation];
+    [smLoc stopMonitoringSignificantLocationChanges];
+    for (CLRegion *region in [smLoc.monitoredRegions copy]) {
+        if ([region.identifier isEqualToString:@"MaxBGFence"]) [smLoc stopMonitoringForRegion:region];
+    }
     smLocRunning = NO;
+    smFenceReady = NO;
 }
 
 static void sm_warnIfNotificationsDenied(void) {
@@ -3063,11 +3175,56 @@ static void sm_bgNotifyChanged(BOOL on) {
     if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) sm_startSilentAudio();
 }
 
+static BOOL (*orig_didFinish)(id, SEL, UIApplication *, NSDictionary *);
+static IMP orig_setAppDelegate;
+
+static void sm_noteLaunch(UIApplication *application, NSDictionary *options, const char *where) {
+    BOOL fromLocation = [options objectForKey:UIApplicationLaunchOptionsLocationKey] != nil;
+    NSLog(@"[MaxBG] launch where=%s reason=%s state=%ld auth=%s",
+          where, fromLocation ? "location" : "normal",
+          (long)application.applicationState, sm_authName(sm_authStatus()));
+    if (!fromLocation || !bgNotify()) return;
+    sm_raiseSocket();
+    sm_startLocation();
+    sm_startSilentAudio();
+}
+
+static BOOL swizzled_didFinish(id self, SEL _cmd, UIApplication *application, NSDictionary *options) {
+    BOOL ok = orig_didFinish ? orig_didFinish(self, _cmd, application, options) : YES;
+    sm_noteLaunch(application, options, "didFinish");
+    return ok;
+}
+
+static void sm_hookDelegate(id delegate) {
+    if (!delegate) return;
+    Class cls = object_getClass(delegate);
+    SEL sel = @selector(application:didFinishLaunchingWithOptions:);
+    Method method = class_getInstanceMethod(cls, sel);
+    if (!method) return;
+    static Class hookedClass;
+    if (hookedClass == cls) return;
+    hookedClass = cls;
+    orig_didFinish = (BOOL (*)(id, SEL, UIApplication *, NSDictionary *))method_getImplementation(method);
+    method_setImplementation(method, (IMP)swizzled_didFinish);
+    NSLog(@"[MaxBG] hooked %s", class_getName(cls));
+}
+
+static void swizzled_setAppDelegate(id self, SEL _cmd, id delegate) {
+    if (orig_setAppDelegate) ((void (*)(id, SEL, id))orig_setAppDelegate)(self, _cmd, delegate);
+    sm_hookDelegate(delegate);
+}
+
 static void hookBgNotify(void) {
     sm_hook_own(objc_getClass("OKMAppStateManager"), "keepSocketInBackground", (IMP)swizzled_keepSocket, &orig_keepSocket);
     sm_hook_own(objc_getClass("OKMMessengerClient"), "disconnectIfNeeded", (IMP)swizzled_disconnectIfNeeded, &orig_disconnectIfNeeded);
     sm_hook_own(objc_getClass("OKMIncomingMessagesListener"), "_messageReceived:", (IMP)swizzled_messageReceived, &orig_messageReceived);
     sm_hook_own(objc_getClass("OKMInAppBannerPresenter"), "showNewMessageBanner:suppressToast:", (IMP)swizzled_showBanner, &orig_showBanner);
+    Method setDelegate = class_getInstanceMethod([UIApplication class], @selector(setDelegate:));
+    if (setDelegate && !orig_setAppDelegate) {
+        orig_setAppDelegate = method_getImplementation(setDelegate);
+        method_setImplementation(setDelegate, (IMP)swizzled_setAppDelegate);
+    }
+    sm_hookDelegate(UIApplication.sharedApplication.delegate);
     static BOOL watching;
     if (watching) return;
     watching = YES;
@@ -3089,6 +3246,7 @@ static void hookBgNotify(void) {
     }];
     [center addObserverForName:AVAudioSessionInterruptionNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
         NSNumber *type = note.userInfo[AVAudioSessionInterruptionTypeKey];
+        NSLog(@"[MaxBG] audio interruption %@", type);
         if (type.unsignedIntegerValue == AVAudioSessionInterruptionTypeEnded && bgNotify() &&
             UIApplication.sharedApplication.applicationState != UIApplicationStateActive) {
             sm_startSilentAudio();
