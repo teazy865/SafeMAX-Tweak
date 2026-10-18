@@ -2893,6 +2893,9 @@ static void sm_stopSilentAudio(void) {
     [[AVAudioSession sharedInstance] setActive:NO withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation error:nil];
 }
 
+static CLLocationManager *smLoc;
+static BOOL smLocRunning;
+
 static void sm_startLocation(const char *reason);
 
 static void sm_ensureWatch(void) {
@@ -3073,9 +3076,7 @@ static void swizzled_messageReceived(id self, SEL _cmd, id note) {
     sm_postIncoming(note, self);
 }
 
-static CLLocationManager *smLoc;
 static id smLocDelegate;
-static BOOL smLocRunning;
 static BOOL smFenceReady;
 
 static void sm_startLocation(const char *reason);
