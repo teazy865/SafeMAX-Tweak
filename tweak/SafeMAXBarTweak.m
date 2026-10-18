@@ -2857,8 +2857,20 @@ static BOOL sm_audioBusy(void) {
     return [category isEqualToString:AVAudioSessionCategoryPlayAndRecord] || [category isEqualToString:AVAudioSessionCategoryRecord];
 }
 
-static void sm_startSilentAudio(void) {
+static BOOL smCallerLogged;
+
+static void sm_logCallerOnce(const char *reason) {
+    if (smCallerLogged) return;
+    smCallerLogged = YES;
+    NSArray *frames = [NSThread callStackSymbols];
+    id frame = frames.count > 1 ? frames[1] : @"?";
+    sm_fileLog(@"[MaxBG] caller reason=%s %@", reason, frame);
+}
+
+static void sm_startSilentAudio(const char *reason) {
     if (!bgNotify() || sm_audioBusy()) return;
+    if (smSilentPlayer.playing) return;
+    sm_logCallerOnce(reason);
     NSError *error = nil;
     AVAudioSession *session = [AVAudioSession sharedInstance];
     [session setCategory:AVAudioSessionCategoryPlayback withOptions:AVAudioSessionCategoryOptionMixWithOthers error:&error];
@@ -2868,9 +2880,9 @@ static void sm_startSilentAudio(void) {
         smSilentPlayer.numberOfLoops = -1;
         smSilentPlayer.volume = 0.01;
     }
-    if (smSilentPlayer && !smSilentPlayer.playing) [smSilentPlayer play];
+    if (!smSilentPlayer.playing) [smSilentPlayer play];
     smAudioOwned = smSilentPlayer.playing;
-    sm_fileLog(@"[MaxBG] audio %@ err=%@", smSilentPlayer.playing ? @"playing" : @"idle", error);
+    sm_fileLog(@"[MaxBG] audio playing reason=%s err=%@", reason, error);
 }
 
 static void sm_stopSilentAudio(void) {
@@ -2881,15 +2893,17 @@ static void sm_stopSilentAudio(void) {
     [[AVAudioSession sharedInstance] setActive:NO withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation error:nil];
 }
 
-static void sm_startLocation(void);
+static void sm_startLocation(const char *reason);
 
-static void sm_ensureAudioTimer(void) {
+static void sm_ensureWatch(void) {
     if (smAudioTimer) return;
-    smAudioTimer = [NSTimer scheduledTimerWithTimeInterval:15 repeats:YES block:^(__unused NSTimer *timer) {
+    smAudioTimer = [NSTimer scheduledTimerWithTimeInterval:60 repeats:YES block:^(__unused NSTimer *timer) {
         if (!bgNotify()) return;
-        if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive) return;
-        sm_startSilentAudio();
-        sm_startLocation();
+        BOOL background = UIApplication.sharedApplication.applicationState != UIApplicationStateActive;
+        BOOL playing = smSilentPlayer.playing;
+        NSUInteger regions = smLoc.monitoredRegions.count;
+        if (!background || (smLocRunning && playing && regions > 0)) return;
+        sm_fileLog(@"[MaxBG] watch reason=tick loc=%d audio=%d regions=%lu", smLocRunning, playing, (unsigned long)regions);
     }];
 }
 
@@ -3064,9 +3078,9 @@ static id smLocDelegate;
 static BOOL smLocRunning;
 static BOOL smFenceReady;
 
-static void sm_startLocation(void);
+static void sm_startLocation(const char *reason);
 static void sm_raiseSocket(void);
-static void sm_installFence(CLLocation *location);
+static void sm_installFence(CLLocation *location, const char *reason);
 
 static const char *sm_authName(CLAuthorizationStatus status) {
     switch (status) {
@@ -3132,21 +3146,32 @@ static void sm_raiseSocket(void) {
     sm_fileLog(@"[MaxBG] socket client missing");
 }
 
-static void sm_installFence(CLLocation *location) {
+static BOOL sm_hasFence(void) {
+    for (CLRegion *region in smLoc.monitoredRegions) {
+        if ([region.identifier isEqualToString:@"MaxBGFence"]) return YES;
+    }
+    return NO;
+}
+
+static void sm_installFence(CLLocation *location, const char *reason) {
     if (!smLoc || !location) return;
+    if (strcmp(reason, "didExit") != 0 && sm_hasFence()) return;
+    sm_logCallerOnce(reason);
     if (![CLLocationManager isMonitoringAvailableForClass:[CLCircularRegion class]]) {
-        sm_fileLog(@"[MaxBG] fence unavailable");
+        sm_fileLog(@"[MaxBG] fence unavailable reason=%s", reason);
         return;
     }
     CLCircularRegion *region = [[CLCircularRegion alloc] initWithCenter:location.coordinate radius:150 identifier:@"MaxBGFence"];
     region.notifyOnExit = YES;
     region.notifyOnEntry = NO;
-    for (CLRegion *old in smLoc.monitoredRegions) {
-        if ([old.identifier isEqualToString:@"MaxBGFence"]) [smLoc stopMonitoringForRegion:old];
+    if (strcmp(reason, "didExit") == 0) {
+        for (CLRegion *old in smLoc.monitoredRegions) {
+            if ([old.identifier isEqualToString:@"MaxBGFence"]) [smLoc stopMonitoringForRegion:old];
+        }
     }
     [smLoc startMonitoringForRegion:region];
     smFenceReady = YES;
-    sm_fileLog(@"[MaxBG] fence lat=%.5f lon=%.5f radius=150", location.coordinate.latitude, location.coordinate.longitude);
+    sm_fileLog(@"[MaxBG] fence reason=%s lat=%.5f lon=%.5f radius=150", reason, location.coordinate.latitude, location.coordinate.longitude);
 }
 
 @interface SMBgLocator : NSObject <CLLocationManagerDelegate>
@@ -3155,25 +3180,24 @@ static void sm_installFence(CLLocation *location) {
 @implementation SMBgLocator
 - (void)locationManagerDidChangeAuthorization:(CLLocationManager *)manager {
     sm_fileLog(@"[MaxBG] auth changed %s", sm_authName(manager.authorizationStatus));
-    if (bgNotify()) sm_startLocation();
+    if (bgNotify()) sm_startLocation("auth");
 }
 - (void)locationManager:(CLLocationManager *)manager didUpdateLocations:(NSArray<CLLocation *> *)locations {
-    if (smFenceReady) return;
-    sm_installFence(locations.lastObject);
     (void)manager;
+    if (sm_hasFence()) return;
+    sm_installFence(locations.lastObject, "firstFix");
 }
 - (void)locationManager:(CLLocationManager *)manager didExitRegion:(CLRegion *)region {
     sm_fileLog(@"[MaxBG] didExitRegion %@", region.identifier);
-    smFenceReady = NO;
-    sm_raiseSocket();
-    sm_startSilentAudio();
     CLLocation *location = manager.location;
-    if (location) sm_installFence(location);
+    if (location) sm_installFence(location, "didExit");
     else [manager requestLocation];
+    sm_raiseSocket();
 }
 @end
 
-static void sm_startLocation(void) {
+static void sm_startLocation(const char *reason) {
+    sm_logCallerOnce(reason);
     if (!bgNotify()) return;
     if (!smLoc) {
         smLocDelegate = [SMBgLocator new];
@@ -3183,8 +3207,9 @@ static void sm_startLocation(void) {
         smLoc.distanceFilter = kCLDistanceFilterNone;
         smLoc.pausesLocationUpdatesAutomatically = NO;
     }
+    if (smLocRunning) return;
     CLAuthorizationStatus status = sm_authStatus();
-    sm_fileLog(@"[MaxBG] location start auth=%s", sm_authName(status));
+    sm_fileLog(@"[MaxBG] location start reason=%s auth=%s", reason, sm_authName(status));
     if (status == kCLAuthorizationStatusNotDetermined) {
         static BOOL asked;
         if (!asked) {
@@ -3194,16 +3219,15 @@ static void sm_startLocation(void) {
         return;
     }
     if (status == kCLAuthorizationStatusDenied || status == kCLAuthorizationStatusRestricted) return;
-    if (smLocRunning) return;
     @try {
         smLoc.allowsBackgroundLocationUpdates = YES;
         [smLoc startUpdatingLocation];
         [smLoc startMonitoringSignificantLocationChanges];
         smLocRunning = YES;
-        sm_fileLog(@"[MaxBG] significant updates on");
+        sm_fileLog(@"[MaxBG] significant on reason=%s", reason);
     } @catch (NSException *exception) {
         smLocRunning = NO;
-        sm_fileLog(@"[MaxBG] location failed %@", exception);
+        sm_fileLog(@"[MaxBG] location failed reason=%s %@", reason, exception);
     }
 }
 
@@ -3242,9 +3266,9 @@ static void sm_bgNotifyChanged(BOOL on) {
     [[UNUserNotificationCenter currentNotificationCenter] requestAuthorizationWithOptions:options completionHandler:^(__unused BOOL granted, __unused NSError *error) {
         dispatch_async(dispatch_get_main_queue(), ^{ sm_warnIfNotificationsDenied(); });
     }];
-    sm_ensureAudioTimer();
-    sm_startLocation();
-    if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) sm_startSilentAudio();
+    sm_ensureWatch();
+    sm_startLocation("toggle");
+    if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) sm_startSilentAudio("toggle");
 }
 
 static BOOL (*orig_didFinish)(id, SEL, UIApplication *, NSDictionary *);
@@ -3257,8 +3281,8 @@ static void sm_noteLaunch(UIApplication *application, NSDictionary *options, con
           (long)application.applicationState, sm_authName(sm_authStatus()));
     if (!fromLocation || !bgNotify()) return;
     sm_raiseSocket();
-    sm_startLocation();
-    sm_startSilentAudio();
+    sm_startLocation("locationLaunch");
+    sm_startSilentAudio("locationLaunch");
 }
 
 static BOOL swizzled_didFinish(id self, SEL _cmd, UIApplication *application, NSDictionary *options) {
@@ -3300,29 +3324,29 @@ static void hookBgNotify(void) {
     static BOOL watching;
     if (watching) return;
     watching = YES;
-    sm_ensureAudioTimer();
+    sm_ensureWatch();
     NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
     [center addObserverForName:UIApplicationWillResignActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
         if (!bgNotify()) return;
-        sm_startSilentAudio();
-        sm_startLocation();
+        sm_startLocation("resign");
+        if (!smSilentPlayer.playing) sm_startSilentAudio("resign");
     }];
     [center addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
         if (!bgNotify()) return;
-        sm_startSilentAudio();
-        sm_startLocation();
+        sm_startLocation("background");
+        if (!smSilentPlayer.playing) sm_startSilentAudio("background");
     }];
     [center addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
         sm_stopSilentAudio();
-        sm_stopLocation();
     }];
     [center addObserverForName:AVAudioSessionInterruptionNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
         NSNumber *type = note.userInfo[AVAudioSessionInterruptionTypeKey];
-        sm_fileLog(@"[MaxBG] audio interruption %@", type);
-        if (type.unsignedIntegerValue == AVAudioSessionInterruptionTypeEnded && bgNotify() &&
-            UIApplication.sharedApplication.applicationState != UIApplicationStateActive) {
-            sm_startSilentAudio();
-        }
+        if (type.unsignedIntegerValue != AVAudioSessionInterruptionTypeEnded || !bgNotify()) return;
+        if (!smSilentPlayer.playing) sm_startSilentAudio("interruption");
+    }];
+    [center addObserverForName:AVAudioSessionMediaServicesWereResetNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
+        smSilentPlayer = nil;
+        if (bgNotify() && !smSilentPlayer.playing) sm_startSilentAudio("mediaReset");
     }];
     if (bgNotify()) sm_bgNotifyChanged(YES);
 }
