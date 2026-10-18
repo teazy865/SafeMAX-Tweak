@@ -2856,6 +2856,8 @@ static void hookGhost(void) {
     }
 }
 
+static void hookStories(void);
+
 static void resolveAndHook(void) {
     static BOOL hooked;
     TabBarClass = objc_getClass("_TtC7OMUIKit6TabBar");
