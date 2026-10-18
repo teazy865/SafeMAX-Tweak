@@ -1725,6 +1725,12 @@ static NSDictionary *sm_snapshot(id message) {
     id cpk = sm_plistId(sm_call(message, "chatPrimaryKey"));
     id sender = sm_plistId(sm_call(message, "senderId"));
     long long ts = sm_callLL(message, "timestampAsInt");
+    if (!ts) ts = sm_callLL(message, "createdTimestamp");
+    if (!ts) {
+        id stamp = sm_call(message, "timestamp");
+        if ([stamp isKindOfClass:[NSDate class]]) ts = (long long)([(NSDate *)stamp timeIntervalSince1970] * 1000.0);
+        else if ([stamp respondsToSelector:@selector(longLongValue)]) ts = [stamp longLongValue];
+    }
     NSString *text = sm_messageBody(message);
     if ([pk isKindOfClass:[NSString class]] && [(NSString *)pk length]) record[@"pk"] = pk;
     else if ([pk isKindOfClass:[NSNumber class]]) record[@"pk"] = [pk stringValue];
@@ -1733,6 +1739,18 @@ static NSDictionary *sm_snapshot(id message) {
     if ([cpk isKindOfClass:[NSString class]] && [(NSString *)cpk length]) record[@"cpk"] = cpk;
     if (sender) record[@"sender"] = [sender isKindOfClass:[NSNumber class]] ? sender : @([sender longLongValue]);
     if (ts) record[@"ts"] = @(ts);
+    if (!record[@"cid"] && !record[@"cpk"] && smSeenPages && orig_getMessages) {
+        for (id page in smSeenPages) {
+            id current = ((id (*)(id, SEL))orig_getMessages)(page, @selector(messages));
+            if (![current isKindOfClass:[NSArray class]] || ![(NSArray *)current count]) continue;
+            id sample = [(NSArray *)current firstObject];
+            id foundChat = sm_plistId(sm_call(sample, "chatId"));
+            id foundKey = sm_plistId(sm_call(sample, "chatPrimaryKey"));
+            if ([foundChat isKindOfClass:[NSNumber class]] || [foundChat isKindOfClass:[NSString class]]) record[@"cid"] = foundChat;
+            if ([foundKey isKindOfClass:[NSString class]] && [(NSString *)foundKey length]) record[@"cpk"] = foundKey;
+            if (record[@"cid"] || record[@"cpk"]) break;
+        }
+    }
     if (text.length) record[@"text"] = text;
     if ([message respondsToSelector:@selector(my)]) {
         BOOL mine = ((BOOL (*)(id, SEL))objc_msgSend)(message, @selector(my));
@@ -2096,6 +2114,12 @@ static id sm_mergeKeptInto(id page, id messages) {
             sm_prefixDeletedMark(message);
         }
         long long ts = sm_callLL(message, "timestampAsInt");
+        if (!ts) ts = sm_callLL(message, "createdTimestamp");
+        if (!ts) {
+            id stamp = sm_call(message, "timestamp");
+            if ([stamp isKindOfClass:[NSDate class]]) ts = (long long)([(NSDate *)stamp timeIntervalSince1970] * 1000.0);
+            else if ([stamp respondsToSelector:@selector(longLongValue)]) ts = [stamp longLongValue];
+        }
         if (ts < minTs) minTs = ts;
         if (ts > maxTs) maxTs = ts;
     }
@@ -2143,7 +2167,7 @@ static id sm_mergeKeptInto(id page, id messages) {
         if (sid && [seen containsObject:[NSString stringWithFormat:@"sid:%lld", sid]]) continue;
         long long ts = [rec[@"ts"] longLongValue];
         BOOL inRange = ts && minTs != LLONG_MAX && ts >= minTs && ts <= maxTs;
-        BOOL tail = tailPage && ts && (maxTs == LLONG_MIN || ts >= maxTs);
+        BOOL tail = tailPage && (!ts || ts >= maxTs);
         if (!inRange && !tail) continue;
         id made = sm_makeMessage(rec);
         if (!made) continue;
@@ -2320,9 +2344,9 @@ static BOOL sm_cellIsDeleted(UIView *cell) {
         if (sm_flaggedDeleted(message)) return YES;
         if (sm_isKeptKey(sm_call(message, "primaryKey"))) return YES;
         if (sm_isKeptServerId(sm_call(message, "serverId"))) return YES;
-        if (sm_isDeletedBody(sm_messageBody(message))) return YES;
+        return NO;
     }
-    return sm_treeHasDeletedText(cell);
+    return NO;
 }
 
 static UIView *sm_messageBubble(UIView *cell) {
