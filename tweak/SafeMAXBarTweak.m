@@ -1197,8 +1197,20 @@ static id swizzled_deleteLocal(id self, SEL _cmd, id messageIds, id chat) {
     return ((id (*)(id, SEL, id, id))orig_deleteLocal)(self, _cmd, messageIds, chat);
 }
 
+static char smDeletedFlagKey;
+
+static void sm_flagDeleted(id message) {
+    if (!message || [message isKindOfClass:[NSString class]] || [message isKindOfClass:[NSNumber class]]) return;
+    objc_setAssociatedObject(message, &smDeletedFlagKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static BOOL sm_flaggedDeleted(id message) {
+    return message && [objc_getAssociatedObject(message, &smDeletedFlagKey) boolValue];
+}
+
 static void swizzled_setStatus(id self, SEL _cmd, NSUInteger status) {
     if (keepDeleted() && status == 2 && smMessageClass && [self isKindOfClass:smMessageClass]) {
+        sm_flagDeleted(self);
         sm_rememberSnapshot(sm_snapshot(self));
         sm_refreshDeletedLooks();
         return;
@@ -1344,7 +1356,10 @@ static void sm_markIdsInOpenPages(id ids) {
         if (![current respondsToSelector:@selector(countByEnumeratingWithState:objects:count:)]) continue;
         for (id message in current) {
             for (id item in items) {
-                if (sm_sameId(message, item)) sm_prefixDeletedMark(message);
+                if (!sm_sameId(message, item)) continue;
+                sm_flagDeleted(message);
+                sm_rememberSnapshot(sm_snapshot(message));
+                sm_prefixDeletedMark(message);
             }
         }
     }
@@ -1483,6 +1498,7 @@ static void sm_markRemoved(id previous, id incoming) {
     for (id message in (NSArray *)previous) {
         NSString *key = sm_msgKey(message);
         if (key.length && [stay containsObject:key]) continue;
+        sm_flagDeleted(message);
         sm_rememberSnapshot(sm_snapshot(message));
     }
 }
@@ -1500,6 +1516,10 @@ static void swizzled_setMessages(id self, SEL _cmd, id messages) {
                 sm_refreshDeletedLooks();
                 return;
             }
+            g_inMerge = YES;
+            id merged = sm_mergeKeptInto(self, messages);
+            g_inMerge = NO;
+            if (merged) messages = merged;
         }
     }
     ((void (*)(id, SEL, id))orig_setMessages)(self, _cmd, messages);
@@ -2048,6 +2068,7 @@ static id sm_makeMessage(NSDictionary *rec) {
     if (rec[@"my"] && [message respondsToSelector:@selector(setMy:)]) {
         ((void (*)(id, SEL, BOOL))objc_msgSend)(message, @selector(setMy:), [rec[@"my"] boolValue]);
     }
+    sm_flagDeleted(message);
     return message;
 }
 
@@ -2067,6 +2088,10 @@ static id sm_mergeKeptInto(id page, id messages) {
     for (id message in current) {
         NSString *key = sm_msgKey(message);
         if (key) [seen addObject:key];
+        id sidValue = sm_call(message, "serverId");
+        if ([sidValue respondsToSelector:@selector(longLongValue)] && [sidValue longLongValue]) {
+            [seen addObject:[NSString stringWithFormat:@"sid:%lld", [sidValue longLongValue]]];
+        }
         if (sm_isKeptKey(sm_call(message, "primaryKey")) || sm_isKeptServerId(sm_call(message, "serverId"))) {
             sm_prefixDeletedMark(message);
         }
@@ -2092,6 +2117,23 @@ static id sm_mergeKeptInto(id page, id messages) {
     if ([page respondsToSelector:@selector(isLastPage)]) {
         lastPage = ((BOOL (*)(id, SEL))objc_msgSend)(page, @selector(isLastPage));
     }
+    static NSMutableDictionary<NSString *, NSNumber *> *smNewestTs;
+    NSString *chatKey = nil;
+    id chatId = sm_call(sample, "chatId");
+    if ([chatId respondsToSelector:@selector(longLongValue)] && [chatId longLongValue]) chatKey = [chatId stringValue];
+    if (!chatKey) {
+        id chatPk = sm_call(sample, "chatPrimaryKey");
+        if ([chatPk isKindOfClass:[NSString class]]) chatKey = chatPk;
+    }
+    BOOL tailPage = lastPage;
+    if (chatKey.length && maxTs != LLONG_MIN) {
+        if (!smNewestTs) smNewestTs = [NSMutableDictionary dictionary];
+        long long known = [smNewestTs[chatKey] longLongValue];
+        if (maxTs >= known) {
+            smNewestTs[chatKey] = @(maxTs);
+            tailPage = YES;
+        }
+    }
     NSMutableArray *extra = [NSMutableArray array];
     for (NSDictionary *rec in recs) {
         if (![rec isKindOfClass:[NSDictionary class]] || !sm_sameChat(rec, sample)) continue;
@@ -2101,7 +2143,7 @@ static id sm_mergeKeptInto(id page, id messages) {
         if (sid && [seen containsObject:[NSString stringWithFormat:@"sid:%lld", sid]]) continue;
         long long ts = [rec[@"ts"] longLongValue];
         BOOL inRange = ts && minTs != LLONG_MAX && ts >= minTs && ts <= maxTs;
-        BOOL tail = lastPage && ts && (maxTs == LLONG_MIN || ts > maxTs);
+        BOOL tail = tailPage && ts && (maxTs == LLONG_MIN || ts >= maxTs);
         if (!inRange && !tail) continue;
         id made = sm_makeMessage(rec);
         if (!made) continue;
@@ -2275,6 +2317,7 @@ static BOOL sm_cellIsDeleted(UIView *cell) {
         }
     }
     if (message) {
+        if (sm_flaggedDeleted(message)) return YES;
         if (sm_isKeptKey(sm_call(message, "primaryKey"))) return YES;
         if (sm_isKeptServerId(sm_call(message, "serverId"))) return YES;
         if (sm_isDeletedBody(sm_messageBody(message))) return YES;
