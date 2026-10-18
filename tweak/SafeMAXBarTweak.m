@@ -48,7 +48,7 @@ static BOOL floatingDock(void) {
 
 static BOOL liquidGlass(void) {
     id obj = [[NSUserDefaults standardUserDefaults] objectForKey:kLiquidGlassKey];
-    return obj ? [obj boolValue] : YES;
+    return obj ? [obj boolValue] : NO;
 }
 
 static BOOL ghostMode(void) {
