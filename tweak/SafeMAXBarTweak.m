@@ -2901,6 +2901,10 @@ static void resolveAndHook(void) {
 static BOOL (*orig_storiesEnabled)(id, SEL);
 static void (*orig_storyApply)(id, SEL, id);
 static void (*orig_storyLayout)(id, SEL);
+static id (*orig_storyResponse)(id, SEL, id, unsigned short, BOOL, id, id);
+static NSArray<NSNumber *> *g_storyOwnerIds;
+static NSMutableDictionary<NSNumber *, NSString *> *g_storyNames;
+static NSMutableDictionary<NSNumber *, UIImage *> *g_storyImages;
 
 static BOOL swizzled_storiesEnabled(id self, SEL _cmd) {
     return YES;
@@ -2930,8 +2934,7 @@ static void sm_setDoubleIvar(id obj, const char *name, double value) {
 
 static UIImage *sm_storyInitial(NSString *name) {
     NSString *letter = name.length ? [name substringToIndex:1] : @"?";
-    CGSize size = CGSizeMake(64, 64);
-    UIGraphicsBeginImageContextWithOptions(size, NO, 0);
+    UIGraphicsBeginImageContextWithOptions(CGSizeMake(64, 64), NO, 0);
     [[UIColor colorWithWhite:0.28 alpha:1] setFill];
     [[UIBezierPath bezierPathWithOvalInRect:CGRectMake(0, 0, 64, 64)] fill];
     NSDictionary *attrs = @{
@@ -2945,31 +2948,134 @@ static UIImage *sm_storyInitial(NSString *name) {
     return image;
 }
 
+static void sm_collectStoryOwners(id obj, NSMutableArray<NSNumber *> *out, NSMutableSet *seen, int depth) {
+    if (!obj || depth > 7 || [seen containsObject:obj]) return;
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        [seen addObject:obj];
+        NSDictionary *dict = obj;
+        id owner = dict[@"owner"];
+        id ownerId = dict[@"ownerId"];
+        if (!ownerId && [owner isKindOfClass:[NSDictionary class]]) ownerId = ((NSDictionary *)owner)[@"ownerId"] ?: ((NSDictionary *)owner)[@"id"];
+        if (!ownerId && [owner isKindOfClass:[NSNumber class]]) ownerId = owner;
+        if ([ownerId isKindOfClass:[NSNumber class]] && (dict[@"totalCount"] || dict[@"readCount"] || dict[@"owner"])) {
+            [out addObject:ownerId];
+        }
+        for (id value in dict.allValues) sm_collectStoryOwners(value, out, seen, depth + 1);
+    } else if ([obj isKindOfClass:[NSArray class]]) {
+        [seen addObject:obj];
+        for (id value in obj) sm_collectStoryOwners(value, out, seen, depth + 1);
+    }
+}
+
+static void sm_refreshStoryTree(UIView *view) {
+    const char *name = class_getName(object_getClass(view));
+    if (name && strstr(name, "StoriesCollectionViewCell")) [view setNeedsLayout];
+    for (UIView *subview in view.subviews) sm_refreshStoryTree(subview);
+}
+
+static void sm_noteStoryPayload(id data) {
+    NSMutableArray<NSNumber *> *owners = [NSMutableArray array];
+    sm_collectStoryOwners(data, owners, [NSMutableSet set], 0);
+    if (!owners.count && data && ![data isKindOfClass:[NSDictionary class]] && ![data isKindOfClass:[NSArray class]]) {
+        for (NSString *key in @[@"storiesPreviews", @"previews", @"stories", @"items"]) {
+            id value = nil;
+            @try { value = [data valueForKey:key]; } @catch (__unused NSException *exception) { value = nil; }
+            if (value) sm_collectStoryOwners(value, owners, [NSMutableSet set], 0);
+        }
+    }
+    if (!owners.count) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        g_storyOwnerIds = [owners copy];
+        for (UIWindow *window in allWindows()) sm_refreshStoryTree(window);
+    });
+}
+
+static id swizzled_storyResponse(id self, SEL _cmd, id data, unsigned short command, BOOL isError, id error, id block) {
+    if (!isError && (command == 208 || command == 209 || command == 210 || command == 216)) sm_noteStoryPayload(data);
+    return orig_storyResponse(self, _cmd, data, command, isError, error, block);
+}
+
+static id sm_contactsController(UIView *view) {
+    UIResponder *responder = view;
+    while (responder) {
+        const char *name = class_getName(object_getClass(responder));
+        if (name && strstr(name, "ChatListContainer")) return sm_ivarObject(responder, "contactsServiceController");
+        responder = responder.nextResponder;
+    }
+    return nil;
+}
+
+static NSString *sm_contactTitle(id contact) {
+    if (!contact) return nil;
+    SEL full = sel_registerName("primaryFullName");
+    SEL shortName = sel_registerName("primaryName");
+    NSString *name = nil;
+    if ([contact respondsToSelector:full]) name = ((id (*)(id, SEL))objc_msgSend)(contact, full);
+    if (![name isKindOfClass:[NSString class]] || !name.length) {
+        if ([contact respondsToSelector:shortName]) name = ((id (*)(id, SEL))objc_msgSend)(contact, shortName);
+    }
+    return [name isKindOfClass:[NSString class]] && name.length ? name : nil;
+}
+
 static void sm_fillStoryCell(UIView *cell) {
-    if (![cell isKindOfClass:[UIView class]]) return;
+    if (![cell isKindOfClass:[UICollectionViewCell class]]) return;
     static char smStoryFillKey;
     if (objc_getAssociatedObject(cell, &smStoryFillKey)) return;
     objc_setAssociatedObject(cell, &smStoryFillKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     UILabel *title = sm_ivarObject(cell, "titleLabel");
     if ([title isKindOfClass:[UILabel class]]) {
+        UICollectionView *list = (UICollectionView *)cell.superview;
+        while (list && ![list isKindOfClass:[UICollectionView class]]) list = (UICollectionView *)list.superview;
+        NSIndexPath *path = [list indexPathForCell:(UICollectionViewCell *)cell];
+        NSNumber *ownerId = (path && path.item < (NSInteger)g_storyOwnerIds.count) ? g_storyOwnerIds[path.item] : nil;
+        NSString *name = ownerId ? g_storyNames[ownerId] : nil;
+        if (!name.length && ownerId) {
+            id contacts = sm_contactsController(cell);
+            SEL lookup = sel_registerName("contactFor:");
+            if ([contacts respondsToSelector:lookup]) {
+                id contact = ((id (*)(id, SEL, id))objc_msgSend)(contacts, lookup, ownerId);
+                name = sm_contactTitle(contact);
+                if (name.length) {
+                    if (!g_storyNames) g_storyNames = [NSMutableDictionary dictionary];
+                    g_storyNames[ownerId] = name;
+                }
+                if (!g_storyImages[ownerId]) {
+                    SEL avatar = sel_registerName("avatarUrl");
+                    NSString *urlString = [contact respondsToSelector:avatar] ? ((id (*)(id, SEL))objc_msgSend)(contact, avatar) : nil;
+                    if ([urlString isKindOfClass:[NSString class]] && [urlString hasPrefix:@"http"]) {
+                        if (!g_storyImages) g_storyImages = [NSMutableDictionary dictionary];
+                        g_storyImages[ownerId] = (id)[NSNull null];
+                        NSURL *url = [NSURL URLWithString:urlString];
+                        [[[NSURLSession sharedSession] dataTaskWithURL:url completionHandler:^(NSData *body, __unused NSURLResponse *response, __unused NSError *error) {
+                            UIImage *image = body ? [UIImage imageWithData:body] : nil;
+                            if (!image) return;
+                            dispatch_async(dispatch_get_main_queue(), ^{
+                                g_storyImages[ownerId] = image;
+                                for (UIWindow *window in allWindows()) sm_refreshStoryTree(window);
+                            });
+                        }] resume];
+                    }
+                }
+            }
+        }
+        if (!name.length) name = title.text;
         title.hidden = NO;
         title.alpha = 1;
         title.textAlignment = NSTextAlignmentCenter;
         title.textColor = UIColor.whiteColor;
-        if (!title.text.length) {
-            NSString *fallback = cell.accessibilityLabel;
-            if (fallback.length) title.text = fallback;
-        }
+        if (name.length) title.text = name;
         if (title.bounds.size.height < 8) {
             title.frame = CGRectMake(0, CGRectGetHeight(cell.bounds) - 14, CGRectGetWidth(cell.bounds), 14);
         }
         cell.clipsToBounds = NO;
         cell.superview.clipsToBounds = NO;
-        NSString *name = title.text;
         id avatar = sm_ivarObject(cell, "avatarView");
         id inner = sm_ivarObject(avatar, "avatarView");
-        if ([inner isKindOfClass:[UIImageView class]] && !((UIImageView *)inner).image && name.length) {
-            ((UIImageView *)inner).image = sm_storyInitial(name);
+        UIImage *photo = (ownerId && [g_storyImages[ownerId] isKindOfClass:[UIImage class]]) ? g_storyImages[ownerId] : nil;
+        if ([inner isKindOfClass:[UIImageView class]] && (photo || name.length)) {
+            UIImageView *imageView = inner;
+            if (photo) imageView.image = photo;
+            else if (!imageView.image) imageView.image = sm_storyInitial(name);
             id empty = sm_ivarObject(avatar, "emptyStateImageView");
             if ([empty isKindOfClass:[UIView class]]) ((UIView *)empty).hidden = YES;
         }
@@ -2994,6 +3100,8 @@ static void hookStories(void) {
     Class cell = objc_getClass("_TtC7Stories25StoriesCollectionViewCell");
     sm_hook_own(cell, "applyLayoutAttributes:", (IMP)swizzled_storyApply, (IMP *)&orig_storyApply);
     sm_hook_own(cell, "layoutSubviews", (IMP)swizzled_storyLayout, (IMP *)&orig_storyLayout);
+    Class client = objc_getClass("OKMMessengerClient");
+    sm_hook_own(client, "_onSendDataResponse:command:isErrorAck:error:resultBlock:", (IMP)swizzled_storyResponse, (IMP *)&orig_storyResponse);
 }
 
 static void hookLiquidGlassFlag(void);
