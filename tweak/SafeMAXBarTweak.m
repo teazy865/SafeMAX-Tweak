@@ -1210,8 +1210,9 @@ static BOOL sm_flaggedDeleted(id message) {
 
 static void swizzled_setStatus(id self, SEL _cmd, NSUInteger status) {
     if (keepDeleted() && status == 2 && smMessageClass && [self isKindOfClass:smMessageClass]) {
-        sm_flagDeleted(self);
-        sm_rememberSnapshot(sm_snapshot(self));
+        NSDictionary *snap = sm_snapshot(self);
+        if (snap) sm_rememberSnapshot(snap);
+        else sm_rememberDeletedText(sm_messageBody(self));
         sm_refreshDeletedLooks();
         return;
     }
@@ -1369,7 +1370,7 @@ static void sm_keepInsteadOfDelete(id service, id ids) {
     sm_captureOpenPages();
     sm_markIdsInOpenPages(ids);
     sm_noteDeletedPayload(ids, nil, service);
-    sm_refreshDeletedLooks();
+    sm_reloadHistory();
 }
 
 static void swizzled_deletePks(id self, SEL _cmd, id pks, BOOL deleteForAll, id tasks) {
@@ -1480,8 +1481,20 @@ static id sm_mergeKeptInto(id page, id messages);
 
 static id swizzled_getMessages(id self, SEL _cmd) {
     id messages = ((id (*)(id, SEL))orig_getMessages)(self, _cmd);
-    if (keepDeleted() && !g_inMerge) sm_trackPage(self);
-    return messages;
+    if (!keepDeleted() || g_inMerge) return messages;
+    sm_trackPage(self);
+    sm_rememberLongerPage(self, messages);
+    messages = sm_longerSnapshot(self, messages);
+    id cachedSource = objc_getAssociatedObject(self, &smMergedSourceKey);
+    id cachedMerged = objc_getAssociatedObject(self, &smMergedValueKey);
+    if (cachedSource == messages && cachedMerged) return cachedMerged;
+    g_inMerge = YES;
+    id merged = sm_mergeKeptInto(self, messages);
+    g_inMerge = NO;
+    if (!merged) merged = messages;
+    objc_setAssociatedObject(self, &smMergedSourceKey, messages, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(self, &smMergedValueKey, merged, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return merged;
 }
 
 static NSString *sm_msgKey(id message);
@@ -1504,22 +1517,19 @@ static void sm_markRemoved(id previous, id incoming) {
 }
 
 static void swizzled_setMessages(id self, SEL _cmd, id messages) {
-    if (keepDeleted() && !g_inMerge && orig_getMessages) {
+    if (keepDeleted() && !g_inMerge) {
         const char *name = class_getName(object_getClass(self));
         if (name && strstr(name, "HistoryPage")) {
             sm_trackPage(self);
-            id current = ((id (*)(id, SEL))orig_getMessages)(self, @selector(messages));
-            NSUInteger oldCount = [current respondsToSelector:@selector(count)] ? [(NSArray *)current count] : 0;
-            NSUInteger newCount = [messages respondsToSelector:@selector(count)] ? [(NSArray *)messages count] : 0;
-            if (oldCount > 0 && newCount < oldCount) {
-                sm_markRemoved(current, messages);
-                sm_refreshDeletedLooks();
-                return;
-            }
+            id preserved = sm_longerSnapshot(self, messages);
+            if (preserved != messages) messages = preserved;
             g_inMerge = YES;
             id merged = sm_mergeKeptInto(self, messages);
             g_inMerge = NO;
             if (merged) messages = merged;
+            sm_rememberLongerPage(self, messages);
+            objc_setAssociatedObject(self, &smMergedSourceKey, nil, OBJC_ASSOCIATION_ASSIGN);
+            objc_setAssociatedObject(self, &smMergedValueKey, nil, OBJC_ASSOCIATION_ASSIGN);
         }
     }
     ((void (*)(id, SEL, id))orig_setMessages)(self, _cmd, messages);
@@ -2192,7 +2202,16 @@ static void sm_noteHistoryPage(id value) {
     if (!keepDeleted() || !value || g_inMerge) return;
     const char *name = class_getName(object_getClass(value));
     if (!name || !strstr(name, "HistoryPage")) return;
-    sm_trackPage(value);
+    if (![value respondsToSelector:@selector(messages)] || ![value respondsToSelector:@selector(setMessages:)]) return;
+    id current = ((id (*)(id, SEL))objc_msgSend)(value, @selector(messages));
+    g_inMerge = YES;
+    id merged = sm_mergeKeptInto(value, current);
+    g_inMerge = NO;
+    if (merged && merged != current) {
+        g_inMerge = YES;
+        ((void (*)(id, SEL, id))objc_msgSend)(value, @selector(setMessages:), merged);
+        g_inMerge = NO;
+    }
 }
 
 static NSString *sm_stringFromText(id value) {
@@ -2333,6 +2352,7 @@ static UILabel *sm_timeLabel(UIView *view) {
 
 static BOOL sm_cellIsDeleted(UIView *cell) {
     if (!keepDeleted()) return NO;
+    if (sm_treeHasDeletedText(cell)) return YES;
     id message = sm_boundMessage(cell);
     if (!message) {
         for (UIView *subview in cell.subviews) {
@@ -2340,13 +2360,11 @@ static BOOL sm_cellIsDeleted(UIView *cell) {
             if (message) break;
         }
     }
-    if (message) {
-        if (sm_flaggedDeleted(message)) return YES;
-        if (sm_isKeptKey(sm_call(message, "primaryKey"))) return YES;
-        if (sm_isKeptServerId(sm_call(message, "serverId"))) return YES;
-        return NO;
-    }
-    return NO;
+    if (!message) return NO;
+    if (sm_flaggedDeleted(message)) return YES;
+    if (sm_isKeptKey(sm_call(message, "primaryKey"))) return YES;
+    if (sm_isKeptServerId(sm_call(message, "serverId"))) return YES;
+    return sm_isDeletedBody(sm_messageBody(message));
 }
 
 static UIView *sm_messageBubble(UIView *cell) {
