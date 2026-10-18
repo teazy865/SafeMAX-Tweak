@@ -1198,7 +1198,11 @@ static id swizzled_deleteLocal(id self, SEL _cmd, id messageIds, id chat) {
 }
 
 static void swizzled_setStatus(id self, SEL _cmd, NSUInteger status) {
-    if (keepDeleted() && status == 2 && smMessageClass && [self isKindOfClass:smMessageClass]) return;
+    if (keepDeleted() && status == 2 && smMessageClass && [self isKindOfClass:smMessageClass]) {
+        sm_rememberSnapshot(sm_snapshot(self));
+        sm_refreshDeletedLooks();
+        return;
+    }
     ((void (*)(id, SEL, NSUInteger))orig_setStatus)(self, _cmd, status);
 }
 
@@ -2277,7 +2281,7 @@ static BOOL sm_cellIsDeleted(UIView *cell) {
     if (message) {
         if (sm_isKeptKey(sm_call(message, "primaryKey"))) return YES;
         if (sm_isKeptServerId(sm_call(message, "serverId"))) return YES;
-        return NO;
+        if (sm_isDeletedBody(sm_messageBody(message))) return YES;
     }
     return sm_treeHasDeletedText(cell);
 }
@@ -2435,7 +2439,11 @@ static void swizzled_setMessageText(id self, SEL _cmd, id newText) {
         NSString *newString = nil;
         sm_textIvar(oldText, &oldString);
         Ivar ivar = sm_textIvar(newText, &newString);
-        if (keepDeleted() && oldString.length && newString.length == 0) return;
+        if (keepDeleted() && oldString.length && newString.length == 0) {
+            sm_rememberSnapshot(sm_snapshot(self));
+            sm_refreshDeletedLooks();
+            return;
+        }
         if (keepEdits() && oldString.length && newString.length && [newString rangeOfString:smEditMarker].location == NSNotFound) {
             NSArray<NSString *> *oldParts = [oldString componentsSeparatedByString:smEditMarker];
             if ([oldParts containsObject:newString]) {
