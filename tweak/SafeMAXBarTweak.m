@@ -594,12 +594,19 @@ static BOOL sm_readColor(UIColor *color, CGFloat *red, CGFloat *green, CGFloat *
     return YES;
 }
 
-static BOOL sm_isDarkGray(UIColor *color) {
+static BOOL sm_isPlateColor(UIColor *color) {
     CGFloat r, g, b, a;
     if (!sm_readColor(color, &r, &g, &b, &a) || a < 0.85) return NO;
     CGFloat maxv = MAX(r, MAX(g, b));
     CGFloat minv = MIN(r, MIN(g, b));
-    return maxv > 0.04 && maxv < 0.30 && (maxv - minv) < 0.07;
+    if ((maxv - minv) > 0.08) return NO;
+    return (maxv > 0.04 && maxv < 0.35) || minv > 0.72;
+}
+
+static BOOL sm_colorIsLight(UIColor *color) {
+    CGFloat r, g, b, a;
+    if (!sm_readColor(color, &r, &g, &b, &a)) return NO;
+    return (0.299 * r + 0.587 * g + 0.114 * b) > 0.6;
 }
 
 static UIColor *sm_entryBackground(void) {
@@ -607,11 +614,12 @@ static UIColor *sm_entryBackground(void) {
 }
 
 static UIColor *sm_entryForeground(void) {
-    return [UIColor labelColor];
+    return sm_colorIsLight(sm_entryBackground()) ? [UIColor blackColor] : [UIColor whiteColor];
 }
 
 static void sm_samplePlate(UIView *root) {
     if (!root) return;
+    g_plateColor = nil;
     __block UIColor *color = nil;
     __block CGFloat radius = 0;
     __block CGFloat bestArea = 0;
@@ -622,7 +630,7 @@ static void sm_samplePlate(UIView *root) {
         CGFloat height = view.bounds.size.height;
         if (width > root.bounds.size.width * 0.72 && height >= 44 && height <= 96 && view.layer.cornerRadius >= 10) {
             CGFloat area = width * height;
-            if (sm_isDarkGray(view.backgroundColor) && area > bestArea) {
+            if (sm_isPlateColor(view.backgroundColor) && area > bestArea) {
                 color = view.backgroundColor;
                 radius = view.layer.cornerRadius;
                 bestArea = area;
@@ -646,6 +654,11 @@ static void sm_samplePlate(UIView *root) {
 @property (nonatomic, strong) NSMutableArray<NSString *> *hiddenTitles;
 @end
 
+static void sm_followApp(UIViewController *screen, UIViewController *from) {
+    UIUserInterfaceStyle style = from.overrideUserInterfaceStyle;
+    if (style == UIUserInterfaceStyleUnspecified) style = from.traitCollection.userInterfaceStyle;
+    screen.overrideUserInterfaceStyle = style;
+}
 static void presentEditor(UIViewController *from);
 static void presentGhost(UIViewController *from);
 
@@ -654,21 +667,21 @@ static void presentGhost(UIViewController *from);
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (!self) return nil;
-    self.backgroundColor = [UIColor colorWithWhite:0.15 alpha:1];
+    self.backgroundColor = sm_entryBackground();
     self.layer.cornerRadius = 22;
     self.clipsToBounds = YES;
     [self addTarget:self action:@selector(open) forControlEvents:UIControlEventTouchUpInside];
 
     UIImageView *icon = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"dock.rectangle"]];
     icon.tag = 1;
-    icon.tintColor = [UIColor whiteColor];
+    icon.tintColor = sm_entryForeground();
     icon.contentMode = UIViewContentModeScaleAspectFit;
     [self addSubview:icon];
 
     UILabel *title = [[UILabel alloc] init];
     title.tag = 2;
     title.text = @"Нижний док";
-    title.textColor = [UIColor whiteColor];
+    title.textColor = sm_entryForeground();
     title.font = [UIFont systemFontOfSize:17];
     [self addSubview:title];
 
@@ -711,7 +724,6 @@ static void presentGhost(UIViewController *from);
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"Нижний док";
-    self.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
     self.tableView = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStyleInsetGrouped];
     self.tableView.allowsSelectionDuringEditing = YES;
     self.tableView.editing = YES;
@@ -896,7 +908,8 @@ static void presentEditor(UIViewController *from) {
     editor.hiddenTitles = hidden;
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:editor];
     nav.modalPresentationStyle = UIModalPresentationPageSheet;
-    nav.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
+    sm_followApp(editor, from);
+    sm_followApp(nav, from);
     [from presentViewController:nav animated:YES completion:nil];
 }
 
@@ -908,7 +921,6 @@ static void presentEditor(UIViewController *from) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"Невидимка";
-    self.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
     self.tableView = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStyleInsetGrouped];
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(done)];
 }
@@ -947,7 +959,7 @@ static void presentEditor(UIViewController *from) {
     cell.backgroundColor = sm_entryBackground();
     cell.textLabel.textColor = sm_entryForeground();
     cell.textLabel.numberOfLines = 1;
-    cell.detailTextLabel.textColor = [UIColor colorWithWhite:1 alpha:0.55];
+    cell.detailTextLabel.textColor = [sm_entryForeground() colorWithAlphaComponent:0.55];
     cell.detailTextLabel.numberOfLines = 0;
     cell.detailTextLabel.lineBreakMode = NSLineBreakByWordWrapping;
     cell.selectionStyle = UITableViewCellSelectionStyleNone;
@@ -1018,7 +1030,8 @@ static void presentGhost(UIViewController *from) {
     SMGhostEditor *editor = [[SMGhostEditor alloc] init];
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:editor];
     nav.modalPresentationStyle = UIModalPresentationPageSheet;
-    nav.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
+    sm_followApp(editor, from);
+    sm_followApp(nav, from);
     [from presentViewController:nav animated:YES completion:nil];
 }
 
