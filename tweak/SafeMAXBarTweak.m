@@ -8,6 +8,42 @@
 #import <AVFoundation/AVFoundation.h>
 #import <UserNotifications/UserNotifications.h>
 #import <CoreLocation/CoreLocation.h>
+#include <stdarg.h>
+
+static NSString *sm_logPath(void) {
+    NSString *lib = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES).firstObject;
+    NSString *dir = [lib stringByAppendingPathComponent:@"MaxLog"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    return [dir stringByAppendingPathComponent:@"max.log"];
+}
+
+static void sm_fileLog(NSString *format, ...) {
+    va_list args;
+    va_start(args, format);
+    NSString *line = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+    NSLog(@"%@", line);
+    @try {
+        NSString *path = sm_logPath();
+        NSFileManager *files = [NSFileManager defaultManager];
+        if (![files fileExistsAtPath:path]) [files createFileAtPath:path contents:nil attributes:nil];
+        NSDictionary *attrs = [files attributesOfItemAtPath:path error:nil];
+        unsigned long long size = [attrs fileSize];
+        if (size > 1500000) {
+            NSData *all = [NSData dataWithContentsOfFile:path];
+            NSUInteger keep = all.length / 2;
+            [[all subdataWithRange:NSMakeRange(all.length - keep, keep)] writeToFile:path atomically:YES];
+        }
+        NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:path];
+        [handle seekToEndOfFile];
+        NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+        formatter.dateFormat = @"HH:mm:ss";
+        NSString *row = [NSString stringWithFormat:@"%@ %@\n", [formatter stringFromDate:[NSDate date]], line];
+        [handle writeData:[row dataUsingEncoding:NSUTF8StringEncoding]];
+        [handle closeFile];
+    } @catch (__unused NSException *exception) {
+    }
+}
 
 // SafeMAX bottom dock is OMUIKit.TabBar, not UITabBar.
 // Never hide or fade existing subviews: that removes the icons.
@@ -901,7 +937,7 @@ static void presentEditor(UIViewController *from) {
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 1; }
 
-- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section { return 5; }
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section { return 6; }
 
 - (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath { return 88; }
 
@@ -915,6 +951,15 @@ static void presentEditor(UIViewController *from) {
     cell.detailTextLabel.numberOfLines = 0;
     cell.detailTextLabel.lineBreakMode = NSLineBreakByWordWrapping;
     cell.selectionStyle = UITableViewCellSelectionStyleNone;
+    cell.accessoryView = nil;
+    cell.accessoryType = UITableViewCellAccessoryNone;
+    if (indexPath.row == 5) {
+        cell.textLabel.text = @"Показать лог / Поделиться логом";
+        cell.detailTextLabel.text = @"Открывает файл max.log";
+        cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        return cell;
+    }
     BOOL on = NO;
     switch (indexPath.row) {
         case 0:
@@ -949,6 +994,20 @@ static void presentEditor(UIViewController *from) {
     toggle.on = on;
     cell.accessoryView = toggle;
     return cell;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    if (indexPath.row != 5) return;
+    NSString *path = sm_logPath();
+    if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        [@"Лог пуст\n" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+    NSURL *url = [NSURL fileURLWithPath:path];
+    UIActivityViewController *activity = [[UIActivityViewController alloc] initWithActivityItems:@[url] applicationActivities:nil];
+    activity.popoverPresentationController.sourceView = tableView;
+    activity.popoverPresentationController.sourceRect = [tableView rectForRowAtIndexPath:indexPath];
+    [self presentViewController:activity animated:YES completion:nil];
 }
 
 @end
@@ -1218,7 +1277,7 @@ static void swizzled_setStatus(id self, SEL _cmd, NSUInteger status) {
         NSDictionary *snap = sm_snapshot(self);
         sm_keepLive(self);
         sm_archiveFull(self);
-        NSLog(@"[MaxDel] setStatus removed pk=%@ sid=%@ cid=%@", snap[@"pk"], snap[@"sid"], snap[@"cid"]);
+        sm_fileLog(@"[MaxDel] setStatus removed pk=%@ sid=%@ cid=%@", snap[@"pk"], snap[@"sid"], snap[@"cid"]);
         if (snap) sm_rememberSnapshot(snap);
         else sm_rememberDeletedText(sm_messageBody(self));
         sm_refreshDeletedLooks();
@@ -1416,7 +1475,7 @@ static void swizzled_deletePksPublic(id self, SEL _cmd, id pks, BOOL deleteForAl
 }
 
 static id swizzled_processPlain(id self, SEL _cmd, id response, id chatId, BOOL lastPage, BOOL firstPage) {
-    NSLog(@"[MaxDel] processHistoryResponse chat=%@ last=%d first=%d guard=%d", chatId, lastPage, firstPage, sm_historyGuard());
+    sm_fileLog(@"[MaxDel] processHistoryResponse chat=%@ last=%d first=%d guard=%d", chatId, lastPage, firstPage, sm_historyGuard());
     if (sm_historyGuard()) return nil;
     id page = ((id (*)(id, SEL, id, id, BOOL, BOOL))orig_processPlain)(self, _cmd, response, chatId, lastPage, firstPage);
     sm_mergePage(page, "processHistoryResponse");
@@ -1424,7 +1483,7 @@ static id swizzled_processPlain(id self, SEL _cmd, id response, id chatId, BOOL 
 }
 
 static id swizzled_processSparse(id self, SEL _cmd, id response, id chatId, BOOL lastPage, BOOL firstPage, BOOL sparse) {
-    NSLog(@"[MaxDel] processHistoryResponse sparse chat=%@ last=%d first=%d guard=%d", chatId, lastPage, firstPage, sm_historyGuard());
+    sm_fileLog(@"[MaxDel] processHistoryResponse sparse chat=%@ last=%d first=%d guard=%d", chatId, lastPage, firstPage, sm_historyGuard());
     if (sm_historyGuard()) return nil;
     id page = ((id (*)(id, SEL, id, id, BOOL, BOOL, BOOL))orig_processSparse)(self, _cmd, response, chatId, lastPage, firstPage, sparse);
     sm_mergePage(page, "processHistoryResponseSparse");
@@ -1432,14 +1491,14 @@ static id swizzled_processSparse(id self, SEL _cmd, id response, id chatId, BOOL
 }
 
 static void swizzled_processChunk(id self, SEL _cmd, id chunk) {
-    NSLog(@"[MaxDel] processHistoryChunk class=%s guard=%d", chunk ? class_getName(object_getClass(chunk)) : "nil", sm_historyGuard());
+    sm_fileLog(@"[MaxDel] processHistoryChunk class=%s guard=%d", chunk ? class_getName(object_getClass(chunk)) : "nil", sm_historyGuard());
     if (sm_historyGuard()) return;
     if (orig_processChunk) ((void (*)(id, SEL, id))orig_processChunk)(self, _cmd, chunk);
     sm_mergePage(chunk, "processHistoryChunk");
 }
 
 static void swizzled_processChunkNotify(id self, SEL _cmd, id chunk, BOOL notify) {
-    NSLog(@"[MaxDel] processHistoryChunk notify=%d class=%s guard=%d", notify, chunk ? class_getName(object_getClass(chunk)) : "nil", sm_historyGuard());
+    sm_fileLog(@"[MaxDel] processHistoryChunk notify=%d class=%s guard=%d", notify, chunk ? class_getName(object_getClass(chunk)) : "nil", sm_historyGuard());
     if (sm_historyGuard()) return;
     if (orig_processChunkNotify) ((void (*)(id, SEL, id, BOOL))orig_processChunkNotify)(self, _cmd, chunk, notify);
     sm_mergePage(chunk, "processHistoryChunkNotify");
@@ -1453,12 +1512,12 @@ static BOOL sm_isKeptKey(id key);
 
 static void swizzled_removeObject(id self, SEL _cmd, id key, id collection) {
     if (sm_historyGuard() && sm_isChunkCollection(collection)) {
-        NSLog(@"[MaxDel] removeObject blocked chunk key=%@", key);
+        sm_fileLog(@"[MaxDel] removeObject blocked chunk key=%@", key);
         return;
     }
     if (keepDeleted() && sm_isMessagesCollection(collection)) {
         BOOL kept = sm_isKeptKey(key);
-        NSLog(@"[MaxDel] removeObject key=%@ kept=%d", key, kept);
+        sm_fileLog(@"[MaxDel] removeObject key=%@ kept=%d", key, kept);
         if (kept) return;
     }
     ((void (*)(id, SEL, id, id))orig_removeObject)(self, _cmd, key, collection);
@@ -1482,7 +1541,7 @@ static void swizzled_removeCollectionKey(id self, SEL _cmd, id collectionKey, lo
 
 static void swizzled_removeObjects(id self, SEL _cmd, id keys, id collection) {
     if (sm_historyGuard() && sm_isChunkCollection(collection)) {
-        NSLog(@"[MaxDel] removeObjects blocked chunk");
+        sm_fileLog(@"[MaxDel] removeObjects blocked chunk");
         return;
     }
     if (keepDeleted() && sm_isMessagesCollection(collection) && [keys respondsToSelector:@selector(countByEnumeratingWithState:objects:count:)]) {
@@ -1492,7 +1551,7 @@ static void swizzled_removeObjects(id self, SEL _cmd, id keys, id collection) {
             if (sm_isKeptKey(key)) kept++;
             else [rest addObject:key];
         }
-        NSLog(@"[MaxDel] removeObjects total=%lu kept=%lu", (unsigned long)[keys count], (unsigned long)kept);
+        sm_fileLog(@"[MaxDel] removeObjects total=%lu kept=%lu", (unsigned long)[keys count], (unsigned long)kept);
         if (rest.count == 0) return;
         keys = rest;
     }
@@ -1553,7 +1612,7 @@ static void swizzled_setMessages(id self, SEL _cmd, id messages) {
     const char *name = class_getName(object_getClass(self));
     NSUInteger inCount = [messages respondsToSelector:@selector(count)] ? [(NSArray *)messages count] : 0;
     if (name && strstr(name, "HistoryPage")) {
-        NSLog(@"[MaxDel] setMessages in=%lu", (unsigned long)inCount);
+        sm_fileLog(@"[MaxDel] setMessages in=%lu", (unsigned long)inCount);
     }
     if (keepDeleted() && !g_inMerge) {
         if (name && strstr(name, "HistoryPage")) {
@@ -1565,7 +1624,7 @@ static void swizzled_setMessages(id self, SEL _cmd, id messages) {
             g_inMerge = NO;
             if (merged) messages = merged;
             NSUInteger outCount = [messages respondsToSelector:@selector(count)] ? [(NSArray *)messages count] : 0;
-            NSLog(@"[MaxDel] setMessages out=%lu", (unsigned long)outCount);
+            sm_fileLog(@"[MaxDel] setMessages out=%lu", (unsigned long)outCount);
             sm_rememberLongerPage(self, messages);
             objc_setAssociatedObject(self, &smMergedSourceKey, nil, OBJC_ASSOCIATION_ASSIGN);
             objc_setAssociatedObject(self, &smMergedValueKey, nil, OBJC_ASSOCIATION_ASSIGN);
@@ -1849,7 +1908,7 @@ static void sm_rememberSnapshot(NSDictionary *snap) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     [defaults setObject:stored forKey:@"SafeMAX_KeptMessages"];
     [defaults synchronize];
-    NSLog(@"[MaxDel] saved pk=%@ sid=%@ cid=%@ ts=%@ attaches=%@", clean[@"pk"], clean[@"sid"], clean[@"cid"], clean[@"ts"], clean[@"attachCount"]);
+    sm_fileLog(@"[MaxDel] saved pk=%@ sid=%@ cid=%@ ts=%@ attaches=%@", clean[@"pk"], clean[@"sid"], clean[@"cid"], clean[@"ts"], clean[@"attachCount"]);
 }
 
 static NSString *sm_archivePath(NSString *pk) {
@@ -1873,11 +1932,11 @@ static void sm_archiveFull(id message) {
     }
     NSString *path = sm_archivePath(key);
     if (!path) {
-        NSLog(@"[MaxDel] archive skip, no id");
+        sm_fileLog(@"[MaxDel] archive skip, no id");
         return;
     }
     if (![message conformsToProtocol:@protocol(NSCoding)]) {
-        NSLog(@"[MaxDel] archive skip, not NSCoding %@", key);
+        sm_fileLog(@"[MaxDel] archive skip, not NSCoding %@", key);
         return;
     }
     NSData *data = nil;
@@ -1887,16 +1946,16 @@ static void sm_archiveFull(id message) {
         data = [NSKeyedArchiver archivedDataWithRootObject:message];
 #pragma clang diagnostic pop
     } @catch (NSException *exception) {
-        NSLog(@"[MaxDel] archive fail %@ %@", key, exception);
+        sm_fileLog(@"[MaxDel] archive fail %@ %@", key, exception);
         return;
     }
     if (!data.length || ![data writeToFile:path atomically:YES]) {
-        NSLog(@"[MaxDel] archive write fail %@", key);
+        sm_fileLog(@"[MaxDel] archive write fail %@", key);
         return;
     }
     id attaches = sm_call(message, "attaches");
     NSUInteger count = [attaches isKindOfClass:[NSArray class]] ? [(NSArray *)attaches count] : 0;
-    NSLog(@"[MaxDel] archived %@ bytes=%lu attaches=%lu", key, (unsigned long)data.length, (unsigned long)count);
+    sm_fileLog(@"[MaxDel] archived %@ bytes=%lu attaches=%lu", key, (unsigned long)data.length, (unsigned long)count);
 }
 
 static id sm_unarchiveFull(NSString *pk) {
@@ -1909,10 +1968,10 @@ static id sm_unarchiveFull(NSString *pk) {
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
         id object = [NSKeyedUnarchiver unarchiveObjectWithData:data];
 #pragma clang diagnostic pop
-        NSLog(@"[MaxDel] unarchived %@ class=%s", pk, object ? class_getName(object_getClass(object)) : "nil");
+        sm_fileLog(@"[MaxDel] unarchived %@ class=%s", pk, object ? class_getName(object_getClass(object)) : "nil");
         return object;
     } @catch (NSException *exception) {
-        NSLog(@"[MaxDel] unarchive fail %@ %@", pk, exception);
+        sm_fileLog(@"[MaxDel] unarchive fail %@ %@", pk, exception);
         return nil;
     }
 }
@@ -2369,7 +2428,7 @@ static void sm_mergePage(id page, const char *where) {
     id merged = sm_mergeKeptInto(page, current);
     g_inMerge = NO;
     NSUInteger after = merged && [merged respondsToSelector:@selector(count)] ? [(NSArray *)merged count] : before;
-    NSLog(@"[MaxDel] %s %lu -> %lu", where, (unsigned long)before, (unsigned long)after);
+    sm_fileLog(@"[MaxDel] %s %lu -> %lu", where, (unsigned long)before, (unsigned long)after);
     if (merged && merged != current) {
         g_inMerge = YES;
         ((void (*)(id, SEL, id))objc_msgSend)(page, @selector(setMessages:), merged);
@@ -2619,7 +2678,7 @@ static void sm_updateDeletedCell(UIView *cell) {
             if (!smLoggedCells) smLoggedCells = [NSMutableSet set];
             if (![smLoggedCells containsObject:token]) {
                 [smLoggedCells addObject:token];
-                NSLog(@"[MaxDel] cell deleted id=%@", token);
+                sm_fileLog(@"[MaxDel] cell deleted id=%@", token);
             }
         }
     }
@@ -2798,7 +2857,7 @@ static void sm_startSilentAudio(void) {
     }
     if (smSilentPlayer && !smSilentPlayer.playing) [smSilentPlayer play];
     smAudioOwned = smSilentPlayer.playing;
-    NSLog(@"[MaxBG] audio %@ err=%@", smSilentPlayer.playing ? @"playing" : @"idle", error);
+    sm_fileLog(@"[MaxBG] audio %@ err=%@", smSilentPlayer.playing ? @"playing" : @"idle", error);
 }
 
 static void sm_stopSilentAudio(void) {
@@ -3049,21 +3108,21 @@ static void sm_raiseSocket(void) {
     SEL plain = sel_registerName("connect");
     if ([client respondsToSelector:connect]) {
         ((void (*)(id, SEL))objc_msgSend)(client, connect);
-        NSLog(@"[MaxBG] socket connectIfNeeded");
+        sm_fileLog(@"[MaxBG] socket connectIfNeeded");
         return;
     }
     if ([client respondsToSelector:plain]) {
         ((void (*)(id, SEL))objc_msgSend)(client, plain);
-        NSLog(@"[MaxBG] socket connect");
+        sm_fileLog(@"[MaxBG] socket connect");
         return;
     }
-    NSLog(@"[MaxBG] socket client missing");
+    sm_fileLog(@"[MaxBG] socket client missing");
 }
 
 static void sm_installFence(CLLocation *location) {
     if (!smLoc || !location) return;
     if (![CLLocationManager isMonitoringAvailableForClass:[CLCircularRegion class]]) {
-        NSLog(@"[MaxBG] fence unavailable");
+        sm_fileLog(@"[MaxBG] fence unavailable");
         return;
     }
     CLCircularRegion *region = [[CLCircularRegion alloc] initWithCenter:location.coordinate radius:150 identifier:@"MaxBGFence"];
@@ -3074,7 +3133,7 @@ static void sm_installFence(CLLocation *location) {
     }
     [smLoc startMonitoringForRegion:region];
     smFenceReady = YES;
-    NSLog(@"[MaxBG] fence lat=%.5f lon=%.5f radius=150", location.coordinate.latitude, location.coordinate.longitude);
+    sm_fileLog(@"[MaxBG] fence lat=%.5f lon=%.5f radius=150", location.coordinate.latitude, location.coordinate.longitude);
 }
 
 @interface SMBgLocator : NSObject <CLLocationManagerDelegate>
@@ -3082,7 +3141,7 @@ static void sm_installFence(CLLocation *location) {
 
 @implementation SMBgLocator
 - (void)locationManagerDidChangeAuthorization:(CLLocationManager *)manager {
-    NSLog(@"[MaxBG] auth changed %s", sm_authName(manager.authorizationStatus));
+    sm_fileLog(@"[MaxBG] auth changed %s", sm_authName(manager.authorizationStatus));
     if (bgNotify()) sm_startLocation();
 }
 - (void)locationManager:(CLLocationManager *)manager didUpdateLocations:(NSArray<CLLocation *> *)locations {
@@ -3091,7 +3150,7 @@ static void sm_installFence(CLLocation *location) {
     (void)manager;
 }
 - (void)locationManager:(CLLocationManager *)manager didExitRegion:(CLRegion *)region {
-    NSLog(@"[MaxBG] didExitRegion %@", region.identifier);
+    sm_fileLog(@"[MaxBG] didExitRegion %@", region.identifier);
     smFenceReady = NO;
     sm_raiseSocket();
     sm_startSilentAudio();
@@ -3112,7 +3171,7 @@ static void sm_startLocation(void) {
         smLoc.pausesLocationUpdatesAutomatically = NO;
     }
     CLAuthorizationStatus status = sm_authStatus();
-    NSLog(@"[MaxBG] location start auth=%s", sm_authName(status));
+    sm_fileLog(@"[MaxBG] location start auth=%s", sm_authName(status));
     if (status == kCLAuthorizationStatusNotDetermined) {
         static BOOL asked;
         if (!asked) {
@@ -3128,10 +3187,10 @@ static void sm_startLocation(void) {
         [smLoc startUpdatingLocation];
         [smLoc startMonitoringSignificantLocationChanges];
         smLocRunning = YES;
-        NSLog(@"[MaxBG] significant updates on");
+        sm_fileLog(@"[MaxBG] significant updates on");
     } @catch (NSException *exception) {
         smLocRunning = NO;
-        NSLog(@"[MaxBG] location failed %@", exception);
+        sm_fileLog(@"[MaxBG] location failed %@", exception);
     }
 }
 
@@ -3180,7 +3239,7 @@ static IMP orig_setAppDelegate;
 
 static void sm_noteLaunch(UIApplication *application, NSDictionary *options, const char *where) {
     BOOL fromLocation = [options objectForKey:UIApplicationLaunchOptionsLocationKey] != nil;
-    NSLog(@"[MaxBG] launch where=%s reason=%s state=%ld auth=%s",
+    sm_fileLog(@"[MaxBG] launch where=%s reason=%s state=%ld auth=%s",
           where, fromLocation ? "location" : "normal",
           (long)application.applicationState, sm_authName(sm_authStatus()));
     if (!fromLocation || !bgNotify()) return;
@@ -3206,7 +3265,7 @@ static void sm_hookDelegate(id delegate) {
     hookedClass = cls;
     orig_didFinish = (BOOL (*)(id, SEL, UIApplication *, NSDictionary *))method_getImplementation(method);
     method_setImplementation(method, (IMP)swizzled_didFinish);
-    NSLog(@"[MaxBG] hooked %s", class_getName(cls));
+    sm_fileLog(@"[MaxBG] hooked %s", class_getName(cls));
 }
 
 static void swizzled_setAppDelegate(id self, SEL _cmd, id delegate) {
@@ -3246,7 +3305,7 @@ static void hookBgNotify(void) {
     }];
     [center addObserverForName:AVAudioSessionInterruptionNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
         NSNumber *type = note.userInfo[AVAudioSessionInterruptionTypeKey];
-        NSLog(@"[MaxBG] audio interruption %@", type);
+        sm_fileLog(@"[MaxBG] audio interruption %@", type);
         if (type.unsignedIntegerValue == AVAudioSessionInterruptionTypeEnded && bgNotify() &&
             UIApplication.sharedApplication.applicationState != UIApplicationStateActive) {
             sm_startSilentAudio();
