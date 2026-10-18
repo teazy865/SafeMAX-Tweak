@@ -2899,14 +2899,101 @@ static void resolveAndHook(void) {
 }
 
 static BOOL (*orig_storiesEnabled)(id, SEL);
+static void (*orig_storyApply)(id, SEL, id);
+static void (*orig_storyLayout)(id, SEL);
 
 static BOOL swizzled_storiesEnabled(id self, SEL _cmd) {
     return YES;
 }
 
+static id sm_ivarObject(id obj, const char *name) {
+    Class cls = object_getClass(obj);
+    while (cls && cls != [NSObject class]) {
+        Ivar ivar = class_getInstanceVariable(cls, name);
+        if (ivar) return object_getIvar(obj, ivar);
+        cls = class_getSuperclass(cls);
+    }
+    return nil;
+}
+
+static void sm_setDoubleIvar(id obj, const char *name, double value) {
+    Class cls = object_getClass(obj);
+    while (cls && cls != [NSObject class]) {
+        Ivar ivar = class_getInstanceVariable(cls, name);
+        if (ivar) {
+            *(double *)((uint8_t *)(__bridge void *)obj + ivar_getOffset(ivar)) = value;
+            return;
+        }
+        cls = class_getSuperclass(cls);
+    }
+}
+
+static UIImage *sm_storyInitial(NSString *name) {
+    NSString *letter = name.length ? [name substringToIndex:1] : @"?";
+    CGSize size = CGSizeMake(64, 64);
+    UIGraphicsBeginImageContextWithOptions(size, NO, 0);
+    [[UIColor colorWithWhite:0.28 alpha:1] setFill];
+    [[UIBezierPath bezierPathWithOvalInRect:CGRectMake(0, 0, 64, 64)] fill];
+    NSDictionary *attrs = @{
+        NSFontAttributeName: [UIFont systemFontOfSize:26 weight:UIFontWeightSemibold],
+        NSForegroundColorAttributeName: UIColor.whiteColor
+    };
+    CGSize text = [letter sizeWithAttributes:attrs];
+    [letter drawAtPoint:CGPointMake((64 - text.width) / 2.0, (64 - text.height) / 2.0) withAttributes:attrs];
+    UIImage *image = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+    return image;
+}
+
+static void sm_fillStoryCell(UIView *cell) {
+    if (![cell isKindOfClass:[UIView class]]) return;
+    static char smStoryFillKey;
+    if (objc_getAssociatedObject(cell, &smStoryFillKey)) return;
+    objc_setAssociatedObject(cell, &smStoryFillKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    UILabel *title = sm_ivarObject(cell, "titleLabel");
+    if ([title isKindOfClass:[UILabel class]]) {
+        title.hidden = NO;
+        title.alpha = 1;
+        title.textAlignment = NSTextAlignmentCenter;
+        title.textColor = UIColor.whiteColor;
+        if (!title.text.length) {
+            NSString *fallback = cell.accessibilityLabel;
+            if (fallback.length) title.text = fallback;
+        }
+        if (title.bounds.size.height < 8) {
+            title.frame = CGRectMake(0, CGRectGetHeight(cell.bounds) - 14, CGRectGetWidth(cell.bounds), 14);
+        }
+        cell.clipsToBounds = NO;
+        cell.superview.clipsToBounds = NO;
+        NSString *name = title.text;
+        id avatar = sm_ivarObject(cell, "avatarView");
+        id inner = sm_ivarObject(avatar, "avatarView");
+        if ([inner isKindOfClass:[UIImageView class]] && !((UIImageView *)inner).image && name.length) {
+            ((UIImageView *)inner).image = sm_storyInitial(name);
+            id empty = sm_ivarObject(avatar, "emptyStateImageView");
+            if ([empty isKindOfClass:[UIView class]]) ((UIView *)empty).hidden = YES;
+        }
+    }
+    objc_setAssociatedObject(cell, &smStoryFillKey, nil, OBJC_ASSOCIATION_ASSIGN);
+}
+
+static void swizzled_storyApply(id self, SEL _cmd, id attrs) {
+    sm_setDoubleIvar(attrs, "titleAlpha", 1.0);
+    orig_storyApply(self, _cmd, attrs);
+    sm_fillStoryCell(self);
+}
+
+static void swizzled_storyLayout(id self, SEL _cmd) {
+    orig_storyLayout(self, _cmd);
+    sm_fillStoryCell(self);
+}
+
 static void hookStories(void) {
-    Class cls = objc_getClass("_TtC23OKMAppMessengerProtocol18OMPMSConfigStorage");
-    sm_hook_own(cls, "storiesEnabled", (IMP)swizzled_storiesEnabled, (IMP *)&orig_storiesEnabled);
+    Class storage = objc_getClass("_TtC23OKMAppMessengerProtocol18OMPMSConfigStorage");
+    sm_hook_own(storage, "storiesEnabled", (IMP)swizzled_storiesEnabled, (IMP *)&orig_storiesEnabled);
+    Class cell = objc_getClass("_TtC7Stories25StoriesCollectionViewCell");
+    sm_hook_own(cell, "applyLayoutAttributes:", (IMP)swizzled_storyApply, (IMP *)&orig_storyApply);
+    sm_hook_own(cell, "layoutSubviews", (IMP)swizzled_storyLayout, (IMP *)&orig_storyLayout);
 }
 
 static void hookLiquidGlassFlag(void);
