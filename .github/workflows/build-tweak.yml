@@ -1,4 +1,4 @@
-name: Build SafeMAX Tweak IPA
+name: Build Max
 
 on:
   workflow_dispatch:
@@ -144,12 +144,12 @@ jobs:
 
       - name: Package IPA
         run: |
-          cd extracted && zip -qr ../SafeMAX-tweaked.ipa Payload
-          ls -lh ../SafeMAX-tweaked.ipa
+          cd extracted && zip -qr "../max-${{ github.run_number }}.ipa" Payload
+          ls -lh "../max-${{ github.run_number }}.ipa"
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: SafeMAX-tweaked
-          path: SafeMAX-tweaked.ipa
+          name: max-${{ github.run_number }}
+          path: max-${{ github.run_number }}.ipa
           retention-days: 30
