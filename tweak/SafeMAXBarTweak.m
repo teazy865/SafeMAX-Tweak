@@ -1295,6 +1295,61 @@ static void sm_rememberLongerPage(id page, id messages) {
     [smPageSnapshots setObject:[(NSArray *)messages copy] forKey:page];
 }
 
+static long long sm_callLL(id obj, const char *selName);
+static NSString *sm_msgKey(id message);
+static NSMutableDictionary<NSString *, NSArray *> *smChatHistory;
+
+static NSString *sm_chatKeyOf(id message) {
+    id cid = sm_call(message, "chatId");
+    if ([cid respondsToSelector:@selector(longLongValue)]) {
+        long long value = [cid longLongValue];
+        if (value) return [NSString stringWithFormat:@"%lld", value];
+    }
+    id cpk = sm_call(message, "chatPrimaryKey");
+    if ([cpk isKindOfClass:[NSString class]] && [(NSString *)cpk length]) return cpk;
+    return nil;
+}
+
+static id sm_keepFullChat(id messages) {
+    if (![messages isKindOfClass:[NSArray class]] || [(NSArray *)messages count] == 0) return messages;
+    NSString *chatKey = sm_chatKeyOf([(NSArray *)messages firstObject]);
+    if (!chatKey) return messages;
+    if (!smChatHistory) smChatHistory = [NSMutableDictionary dictionary];
+    NSArray *previous = smChatHistory[chatKey];
+    if (previous.count <= [(NSArray *)messages count]) {
+        smChatHistory[chatKey] = [(NSArray *)messages copy];
+        return messages;
+    }
+    NSMutableDictionary *byKey = [NSMutableDictionary dictionary];
+    NSMutableArray *order = [NSMutableArray array];
+    for (id message in previous) {
+        NSString *key = sm_msgKey(message);
+        if (!key || byKey[key]) continue;
+        byKey[key] = message;
+        [order addObject:key];
+    }
+    for (id message in (NSArray *)messages) {
+        NSString *key = sm_msgKey(message);
+        if (!key) continue;
+        byKey[key] = message;
+        if (![order containsObject:key]) [order addObject:key];
+    }
+    NSMutableArray *all = [NSMutableArray array];
+    for (NSString *key in order) {
+        id message = byKey[key];
+        if (message) [all addObject:message];
+    }
+    [all sortUsingComparator:^NSComparisonResult(id a, id b) {
+        long long left = sm_callLL(a, "timestampAsInt");
+        long long right = sm_callLL(b, "timestampAsInt");
+        if (left < right) return NSOrderedAscending;
+        if (left > right) return NSOrderedDescending;
+        return NSOrderedSame;
+    }];
+    smChatHistory[chatKey] = [all copy];
+    return all;
+}
+
 static id sm_longerSnapshot(id page, id messages) {
     if (!smPageSnapshots || !page) return messages;
     id snap = [smPageSnapshots objectForKey:page];
@@ -1354,7 +1409,7 @@ static void sm_keepInsteadOfDelete(id service, id ids) {
     sm_captureOpenPages();
     sm_markIdsInOpenPages(ids);
     sm_noteDeletedPayload(ids, nil, service);
-    sm_reloadHistory();
+    sm_refreshDeletedLooks();
 }
 
 static void swizzled_deletePks(id self, SEL _cmd, id pks, BOOL deleteForAll, id tasks) {
@@ -1468,7 +1523,7 @@ static id swizzled_getMessages(id self, SEL _cmd) {
     if (!keepDeleted() || g_inMerge) return messages;
     sm_trackPage(self);
     sm_rememberLongerPage(self, messages);
-    messages = sm_longerSnapshot(self, messages);
+    messages = sm_keepFullChat(sm_longerSnapshot(self, messages));
     id cachedSource = objc_getAssociatedObject(self, &smMergedSourceKey);
     id cachedMerged = objc_getAssociatedObject(self, &smMergedValueKey);
     if (cachedSource == messages && cachedMerged) return cachedMerged;
@@ -1486,6 +1541,7 @@ static void swizzled_setMessages(id self, SEL _cmd, id messages) {
         const char *name = class_getName(object_getClass(self));
         if (name && strstr(name, "HistoryPage")) {
             sm_trackPage(self);
+            messages = sm_keepFullChat(messages);
             id preserved = sm_longerSnapshot(self, messages);
             if (preserved != messages) messages = preserved;
             g_inMerge = YES;
