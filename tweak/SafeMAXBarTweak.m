@@ -2886,12 +2886,25 @@ static void resolveAndHook(void) {
     static id foregroundObserver;
     activeObserver = [center addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
         hookKeepDeleted();
+        hookStories();
         scheduleRestyle();
     }];
     foregroundObserver = [center addObserverForName:UIApplicationWillEnterForegroundNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
         hookKeepDeleted();
+        hookStories();
         scheduleRestyle();
     }];
+}
+
+static BOOL (*orig_storiesEnabled)(id, SEL);
+
+static BOOL swizzled_storiesEnabled(id self, SEL _cmd) {
+    return YES;
+}
+
+static void hookStories(void) {
+    Class cls = objc_getClass("_TtC23OKMAppMessengerProtocol18OMPMSConfigStorage");
+    sm_hook_own(cls, "storiesEnabled", (IMP)swizzled_storiesEnabled, (IMP *)&orig_storiesEnabled);
 }
 
 static void hookLiquidGlassFlag(void);
@@ -2899,6 +2912,7 @@ static void hookLiquidGlassFlag(void);
 __attribute__((constructor))
 static void safeMAXDockInit(void) {
     hookLiquidGlassFlag();
+    hookStories();
     hookGhost();
     hookAntiRead();
     hookKeepDeleted();
@@ -2906,9 +2920,11 @@ static void safeMAXDockInit(void) {
     hookBgNotify();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         resolveAndHook();
+        hookStories();
     });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         resolveAndHook();
+        hookStories();
     });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         hookKeepDeleted();
