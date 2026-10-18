@@ -1183,6 +1183,10 @@ static NSDictionary *sm_snapshot(id message);
 static void sm_rememberSnapshot(NSDictionary *snap);
 static void sm_noteHistoryPage(id value);
 static void sm_keepLive(id message);
+static void sm_archiveFull(id message);
+static id sm_unarchiveFull(NSString *pk);
+static id sm_mergeKeptInto(id page, id messages);
+static void sm_mergePage(id page, const char *where);
 static void sm_captureOpenPages(void);
 static void sm_reloadHistory(void);
 static void sm_keepInsteadOfDelete(id service, id ids);
@@ -1213,6 +1217,8 @@ static void swizzled_setStatus(id self, SEL _cmd, NSUInteger status) {
     if (keepDeleted() && status == 2 && smMessageClass && [self isKindOfClass:smMessageClass]) {
         NSDictionary *snap = sm_snapshot(self);
         sm_keepLive(self);
+        sm_archiveFull(self);
+        NSLog(@"[MaxDel] setStatus removed pk=%@ sid=%@ cid=%@", snap[@"pk"], snap[@"sid"], snap[@"cid"]);
         if (snap) sm_rememberSnapshot(snap);
         else sm_rememberDeletedText(sm_messageBody(self));
         sm_refreshDeletedLooks();
@@ -1362,6 +1368,7 @@ static void sm_markIdsInOpenPages(id ids) {
                 if (!sm_sameId(message, item)) continue;
                 sm_flagDeleted(message);
                 sm_keepLive(message);
+                sm_archiveFull(message);
                 sm_rememberSnapshot(sm_snapshot(message));
                 sm_prefixDeletedMark(message);
             }
@@ -1409,23 +1416,33 @@ static void swizzled_deletePksPublic(id self, SEL _cmd, id pks, BOOL deleteForAl
 }
 
 static id swizzled_processPlain(id self, SEL _cmd, id response, id chatId, BOOL lastPage, BOOL firstPage) {
+    NSLog(@"[MaxDel] processHistoryResponse chat=%@ last=%d first=%d guard=%d", chatId, lastPage, firstPage, sm_historyGuard());
     if (sm_historyGuard()) return nil;
-    return ((id (*)(id, SEL, id, id, BOOL, BOOL))orig_processPlain)(self, _cmd, response, chatId, lastPage, firstPage);
+    id page = ((id (*)(id, SEL, id, id, BOOL, BOOL))orig_processPlain)(self, _cmd, response, chatId, lastPage, firstPage);
+    sm_mergePage(page, "processHistoryResponse");
+    return page;
 }
 
 static id swizzled_processSparse(id self, SEL _cmd, id response, id chatId, BOOL lastPage, BOOL firstPage, BOOL sparse) {
+    NSLog(@"[MaxDel] processHistoryResponse sparse chat=%@ last=%d first=%d guard=%d", chatId, lastPage, firstPage, sm_historyGuard());
     if (sm_historyGuard()) return nil;
-    return ((id (*)(id, SEL, id, id, BOOL, BOOL, BOOL))orig_processSparse)(self, _cmd, response, chatId, lastPage, firstPage, sparse);
+    id page = ((id (*)(id, SEL, id, id, BOOL, BOOL, BOOL))orig_processSparse)(self, _cmd, response, chatId, lastPage, firstPage, sparse);
+    sm_mergePage(page, "processHistoryResponseSparse");
+    return page;
 }
 
 static void swizzled_processChunk(id self, SEL _cmd, id chunk) {
+    NSLog(@"[MaxDel] processHistoryChunk class=%s guard=%d", chunk ? class_getName(object_getClass(chunk)) : "nil", sm_historyGuard());
     if (sm_historyGuard()) return;
     if (orig_processChunk) ((void (*)(id, SEL, id))orig_processChunk)(self, _cmd, chunk);
+    sm_mergePage(chunk, "processHistoryChunk");
 }
 
 static void swizzled_processChunkNotify(id self, SEL _cmd, id chunk, BOOL notify) {
+    NSLog(@"[MaxDel] processHistoryChunk notify=%d class=%s guard=%d", notify, chunk ? class_getName(object_getClass(chunk)) : "nil", sm_historyGuard());
     if (sm_historyGuard()) return;
     if (orig_processChunkNotify) ((void (*)(id, SEL, id, BOOL))orig_processChunkNotify)(self, _cmd, chunk, notify);
+    sm_mergePage(chunk, "processHistoryChunkNotify");
 }
 
 static BOOL sm_isMessagesCollection(id collection) {
@@ -1435,8 +1452,15 @@ static BOOL sm_isMessagesCollection(id collection) {
 static BOOL sm_isKeptKey(id key);
 
 static void swizzled_removeObject(id self, SEL _cmd, id key, id collection) {
-    if (sm_historyGuard() && sm_isChunkCollection(collection)) return;
-    if (keepDeleted() && sm_isMessagesCollection(collection) && sm_isKeptKey(key)) return;
+    if (sm_historyGuard() && sm_isChunkCollection(collection)) {
+        NSLog(@"[MaxDel] removeObject blocked chunk key=%@", key);
+        return;
+    }
+    if (keepDeleted() && sm_isMessagesCollection(collection)) {
+        BOOL kept = sm_isKeptKey(key);
+        NSLog(@"[MaxDel] removeObject key=%@ kept=%d", key, kept);
+        if (kept) return;
+    }
     ((void (*)(id, SEL, id, id))orig_removeObject)(self, _cmd, key, collection);
 }
 
@@ -1457,12 +1481,18 @@ static void swizzled_removeCollectionKey(id self, SEL _cmd, id collectionKey, lo
 }
 
 static void swizzled_removeObjects(id self, SEL _cmd, id keys, id collection) {
-    if (sm_historyGuard() && sm_isChunkCollection(collection)) return;
+    if (sm_historyGuard() && sm_isChunkCollection(collection)) {
+        NSLog(@"[MaxDel] removeObjects blocked chunk");
+        return;
+    }
     if (keepDeleted() && sm_isMessagesCollection(collection) && [keys respondsToSelector:@selector(countByEnumeratingWithState:objects:count:)]) {
         NSMutableArray *rest = [NSMutableArray array];
+        NSUInteger kept = 0;
         for (id key in keys) {
-            if (!sm_isKeptKey(key)) [rest addObject:key];
+            if (sm_isKeptKey(key)) kept++;
+            else [rest addObject:key];
         }
+        NSLog(@"[MaxDel] removeObjects total=%lu kept=%lu", (unsigned long)[keys count], (unsigned long)kept);
         if (rest.count == 0) return;
         keys = rest;
     }
@@ -1520,8 +1550,12 @@ static void sm_markRemoved(id previous, id incoming) {
 }
 
 static void swizzled_setMessages(id self, SEL _cmd, id messages) {
+    const char *name = class_getName(object_getClass(self));
+    NSUInteger inCount = [messages respondsToSelector:@selector(count)] ? [(NSArray *)messages count] : 0;
+    if (name && strstr(name, "HistoryPage")) {
+        NSLog(@"[MaxDel] setMessages in=%lu", (unsigned long)inCount);
+    }
     if (keepDeleted() && !g_inMerge) {
-        const char *name = class_getName(object_getClass(self));
         if (name && strstr(name, "HistoryPage")) {
             sm_trackPage(self);
             id preserved = sm_longerSnapshot(self, messages);
@@ -1530,6 +1564,8 @@ static void swizzled_setMessages(id self, SEL _cmd, id messages) {
             id merged = sm_mergeKeptInto(self, messages);
             g_inMerge = NO;
             if (merged) messages = merged;
+            NSUInteger outCount = [messages respondsToSelector:@selector(count)] ? [(NSArray *)messages count] : 0;
+            NSLog(@"[MaxDel] setMessages out=%lu", (unsigned long)outCount);
             sm_rememberLongerPage(self, messages);
             objc_setAssociatedObject(self, &smMergedSourceKey, nil, OBJC_ASSOCIATION_ASSIGN);
             objc_setAssociatedObject(self, &smMergedValueKey, nil, OBJC_ASSOCIATION_ASSIGN);
@@ -1765,6 +1801,8 @@ static NSDictionary *sm_snapshot(id message) {
         }
     }
     if (text.length) record[@"text"] = text;
+    id attaches = sm_call(message, "attaches");
+    if ([attaches isKindOfClass:[NSArray class]]) record[@"attachCount"] = @([(NSArray *)attaches count]);
     if ([message respondsToSelector:@selector(my)]) {
         BOOL mine = ((BOOL (*)(id, SEL))objc_msgSend)(message, @selector(my));
         record[@"my"] = @(mine);
@@ -1811,6 +1849,72 @@ static void sm_rememberSnapshot(NSDictionary *snap) {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     [defaults setObject:stored forKey:@"SafeMAX_KeptMessages"];
     [defaults synchronize];
+    NSLog(@"[MaxDel] saved pk=%@ sid=%@ cid=%@ ts=%@ attaches=%@", clean[@"pk"], clean[@"sid"], clean[@"cid"], clean[@"ts"], clean[@"attachCount"]);
+}
+
+static NSString *sm_archivePath(NSString *pk) {
+    if (!pk.length) return nil;
+    NSString *safe = [[pk dataUsingEncoding:NSUTF8StringEncoding] base64EncodedStringWithOptions:0];
+    safe = [[safe stringByReplacingOccurrencesOfString:@"/" withString:@"_"] stringByReplacingOccurrencesOfString:@"=" withString:@""];
+    NSString *lib = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES).firstObject;
+    if (!lib.length) return nil;
+    NSString *dir = [lib stringByAppendingPathComponent:@"MaxDeleted"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    return [dir stringByAppendingPathComponent:[safe stringByAppendingString:@".msg"]];
+}
+
+static void sm_archiveFull(id message) {
+    if (!message || [message isKindOfClass:[NSString class]] || [message isKindOfClass:[NSNumber class]]) return;
+    id pk = sm_call(message, "primaryKey");
+    NSString *key = [pk isKindOfClass:[NSString class]] ? pk : nil;
+    if (!key.length) {
+        id sid = sm_call(message, "serverId");
+        if ([sid respondsToSelector:@selector(longLongValue)] && [sid longLongValue]) key = [NSString stringWithFormat:@"sid:%lld", [sid longLongValue]];
+    }
+    NSString *path = sm_archivePath(key);
+    if (!path) {
+        NSLog(@"[MaxDel] archive skip, no id");
+        return;
+    }
+    if (![message conformsToProtocol:@protocol(NSCoding)]) {
+        NSLog(@"[MaxDel] archive skip, not NSCoding %@", key);
+        return;
+    }
+    NSData *data = nil;
+    @try {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        data = [NSKeyedArchiver archivedDataWithRootObject:message];
+#pragma clang diagnostic pop
+    } @catch (NSException *exception) {
+        NSLog(@"[MaxDel] archive fail %@ %@", key, exception);
+        return;
+    }
+    if (!data.length || ![data writeToFile:path atomically:YES]) {
+        NSLog(@"[MaxDel] archive write fail %@", key);
+        return;
+    }
+    id attaches = sm_call(message, "attaches");
+    NSUInteger count = [attaches isKindOfClass:[NSArray class]] ? [(NSArray *)attaches count] : 0;
+    NSLog(@"[MaxDel] archived %@ bytes=%lu attaches=%lu", key, (unsigned long)data.length, (unsigned long)count);
+}
+
+static id sm_unarchiveFull(NSString *pk) {
+    NSString *path = sm_archivePath(pk);
+    if (!path || ![[NSFileManager defaultManager] fileExistsAtPath:path]) return nil;
+    NSData *data = [NSData dataWithContentsOfFile:path];
+    if (!data.length) return nil;
+    @try {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        id object = [NSKeyedUnarchiver unarchiveObjectWithData:data];
+#pragma clang diagnostic pop
+        NSLog(@"[MaxDel] unarchived %@ class=%s", pk, object ? class_getName(object_getClass(object)) : "nil");
+        return object;
+    } @catch (NSException *exception) {
+        NSLog(@"[MaxDel] unarchive fail %@ %@", pk, exception);
+        return nil;
+    }
 }
 
 typedef struct {
@@ -2022,6 +2126,7 @@ static void sm_noteDeletedPayload(id ids, id chat, id serviceOwner) {
     }
     for (id message in messages) {
         sm_keepLive(message);
+        sm_archiveFull(message);
         sm_prefixDeletedMark(message);
         sm_writeMarkedMessage(connection, message);
     }
@@ -2235,7 +2340,8 @@ static id sm_mergeKeptInto(id page, id messages) {
         BOOL inRange = ts && minTs != LLONG_MAX && ts >= minTs && ts <= maxTs;
         BOOL tail = tailPage && (!ts || ts >= maxTs);
         if (!inRange && !tail) continue;
-        id made = sm_makeMessage(rec);
+        id made = pk.length ? sm_unarchiveFull(pk) : nil;
+        if (!made) made = sm_makeMessage(rec);
         if (!made) continue;
         [extra addObject:made];
         if (pk.length) [seen addObject:pk];
@@ -2252,6 +2358,23 @@ static id sm_mergeKeptInto(id page, id messages) {
         return NSOrderedSame;
     }];
     return all;
+}
+
+static void sm_mergePage(id page, const char *where) {
+    if (!keepDeleted() || !page || g_inMerge) return;
+    if (![page respondsToSelector:@selector(messages)] || ![page respondsToSelector:@selector(setMessages:)]) return;
+    id current = ((id (*)(id, SEL))objc_msgSend)(page, @selector(messages));
+    NSUInteger before = [current respondsToSelector:@selector(count)] ? [(NSArray *)current count] : 0;
+    g_inMerge = YES;
+    id merged = sm_mergeKeptInto(page, current);
+    g_inMerge = NO;
+    NSUInteger after = merged && [merged respondsToSelector:@selector(count)] ? [(NSArray *)merged count] : before;
+    NSLog(@"[MaxDel] %s %lu -> %lu", where, (unsigned long)before, (unsigned long)after);
+    if (merged && merged != current) {
+        g_inMerge = YES;
+        ((void (*)(id, SEL, id))objc_msgSend)(page, @selector(setMessages:), merged);
+        g_inMerge = NO;
+    }
 }
 
 static void sm_noteHistoryPage(id value) {
@@ -2486,6 +2609,20 @@ static void sm_updateDeletedCell(UIView *cell) {
     if (objc_getAssociatedObject(cell, &smTrashBusyKey)) return;
     objc_setAssociatedObject(cell, &smTrashBusyKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     BOOL deleted = sm_cellIsDeleted(cell);
+    if (deleted) {
+        id message = sm_boundMessage(cell);
+        id pk = message ? sm_call(message, "primaryKey") : nil;
+        id sid = message ? sm_call(message, "serverId") : nil;
+        NSString *token = pk ? [pk description] : (sid ? [sid description] : nil);
+        if (token.length) {
+            static NSMutableSet<NSString *> *smLoggedCells;
+            if (!smLoggedCells) smLoggedCells = [NSMutableSet set];
+            if (![smLoggedCells containsObject:token]) {
+                [smLoggedCells addObject:token];
+                NSLog(@"[MaxDel] cell deleted id=%@", token);
+            }
+        }
+    }
     UIView *bubble = sm_messageBubble(cell);
     UIView *badge = [cell viewWithTag:kDeletedBadgeTag];
     if (!deleted) {
