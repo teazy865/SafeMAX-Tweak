@@ -1079,12 +1079,9 @@ static void swizzled_layout(id self, SEL _cmd) {
     g_inStyle = NO;
 }
 
-static void sm_installOwnStory(UIViewController *vc);
-
 static void swizzled_vc_layout(id self, SEL _cmd) {
     ((void (*)(id, SEL))orig_vc_layout)(self, _cmd);
     if (SettingsClass && [self isKindOfClass:SettingsClass]) installSettingsEntry((UIViewController *)self);
-    sm_installOwnStory((UIViewController *)self);
 }
 
 static void swizzled_appear(id self, SEL _cmd, BOOL animated) {
@@ -3135,45 +3132,6 @@ static void swizzled_storySelect(id self, SEL _cmd, id collectionView, id path) 
         return;
     }
     if (orig_storySelect) orig_storySelect(self, _cmd, collectionView, path);
-}
-
-@interface SMStoryPlusTarget : NSObject
-- (void)open:(UIButton *)sender;
-@end
-
-@implementation SMStoryPlusTarget
-- (void)open:(UIButton *)sender {
-    id router = objc_getAssociatedObject(sender, "sm_story_router");
-    SEL start = sel_registerName("startStoryCreation");
-    if ([router respondsToSelector:start]) ((void (*)(id, SEL))objc_msgSend)(router, start);
-}
-@end
-
-static void sm_installOwnStory(UIViewController *vc) {
-    if (![vc isKindOfClass:[UIViewController class]] || !vc.isViewLoaded || !vc.view) return;
-    const char *name = class_getName(object_getClass(vc));
-    if (!name || !strstr(name, "ChatListContainer")) return;
-    UIView *host = vc.view;
-    UIButton *button = (UIButton *)[host viewWithTag:0x5701];
-    if (![button isKindOfClass:[UIButton class]]) {
-        static SMStoryPlusTarget *target;
-        static dispatch_once_t once;
-        dispatch_once(&once, ^{ target = [SMStoryPlusTarget new]; });
-        button = [UIButton buttonWithType:UIButtonTypeCustom];
-        button.tag = 0x5701;
-        button.backgroundColor = [UIColor colorWithRed:0.29 green:0.22 blue:0.55 alpha:1];
-        button.layer.cornerRadius = 28;
-        button.layer.borderWidth = 2;
-        button.layer.borderColor = [UIColor colorWithRed:0.55 green:0.40 blue:1 alpha:1].CGColor;
-        [button setTitle:@"+" forState:UIControlStateNormal];
-        [button setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-        button.titleLabel.font = [UIFont systemFontOfSize:28 weight:UIFontWeightMedium];
-        [button addTarget:target action:@selector(open:) forControlEvents:UIControlEventTouchUpInside];
-        [host addSubview:button];
-    }
-    objc_setAssociatedObject(button, "sm_story_router", sm_ivarObject(sm_ivarObject(vc, "model"), "router"), OBJC_ASSOCIATION_ASSIGN);
-    button.frame = CGRectMake(16, host.safeAreaInsets.top + 108, 56, 56);
-    [host bringSubviewToFront:button];
 }
 
 static void hookStories(void) {
