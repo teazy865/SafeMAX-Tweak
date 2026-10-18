@@ -2788,18 +2788,6 @@ static BOOL sm_audioBusy(void) {
 }
 
 static void sm_startSilentAudio(void) {
-    if (!bgNotify() || sm_audioBusy()) return;
-    NSError *error = nil;
-    AVAudioSession *session = [AVAudioSession sharedInstance];
-    [session setCategory:AVAudioSessionCategoryPlayback withOptions:AVAudioSessionCategoryOptionMixWithOthers error:&error];
-    [session setActive:YES error:&error];
-    if (!smSilentPlayer) {
-        smSilentPlayer = [[AVAudioPlayer alloc] initWithData:sm_silentWav() error:&error];
-        smSilentPlayer.numberOfLoops = -1;
-        smSilentPlayer.volume = 1;
-    }
-    if (smSilentPlayer && !smSilentPlayer.playing) [smSilentPlayer play];
-    smAudioOwned = smSilentPlayer.playing;
 }
 
 static void sm_stopSilentAudio(void) {
